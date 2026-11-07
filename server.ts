@@ -49,7 +49,7 @@ app.use(express.json({
 registerQuantRoutes(app);
 
 // AI Studio dev server must strictly listen on port 3000
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 // ======================================================
 // BINANCE DEMO ENDPOINTS

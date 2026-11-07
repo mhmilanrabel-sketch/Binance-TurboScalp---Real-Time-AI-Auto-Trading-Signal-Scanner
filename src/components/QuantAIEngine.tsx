@@ -7,7 +7,7 @@ import React, {
   useState,
 } from 'react';
 
-type S = {
+type Signal = {
   symbol: string;
   direction: 'BUY' | 'SELL' | 'NEUTRAL';
   score: number;
@@ -23,7 +23,7 @@ type S = {
   reasons: string[];
 };
 
-type T = {
+type PaperTrade = {
   id: number;
   symbol: string;
   side: 'BUY' | 'SELL';
@@ -35,22 +35,40 @@ type T = {
   pnl?: number;
 };
 
-const price = (n: number) =>
-  n < 1
-    ? '$' + n.toPrecision(5)
-    : '$' + n.toLocaleString('en-US', {
+const formatPrice = (value: number): string => {
+  if (!Number.isFinite(value)) return '—';
+
+  return value < 1
+    ? '$' + value.toPrecision(5)
+    : '$' + value.toLocaleString('en-US', {
         maximumFractionDigits: 4,
       });
+};
 
-const compact = (n: number) =>
-  n > 1e9
-    ? (n / 1e9).toFixed(1) + 'B'
-    : n > 1e6
-      ? (n / 1e6).toFixed(1) + 'M'
-      : (n / 1e3).toFixed(0) + 'K';
+const compact = (value: number): string => {
+  if (!Number.isFinite(value)) return '—';
+
+  if (value >= 1e9) return (value / 1e9).toFixed(1) + 'B';
+  if (value >= 1e6) return (value / 1e6).toFixed(1) + 'M';
+  if (value >= 1e3) return (value / 1e3).toFixed(1) + 'K';
+
+  return value.toFixed(0);
+};
+
+async function readJson(response: Response): Promise<any> {
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || data.success === false) {
+    throw new Error(
+      data.message || `Request failed (${response.status})`
+    );
+  }
+
+  return data;
+}
 
 export function QuantAIEngine() {
-  const [signals, setSignals] = useState<S[]>([]);
+  const [signals, setSignals] = useState<Signal[]>([]);
   const [markets, setMarkets] = useState(0);
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState('score');
@@ -61,13 +79,14 @@ export function QuantAIEngine() {
   const [size, setSize] = useState('25');
   const [maxOpen, setMaxOpen] = useState('3');
 
-  const [trades, setTrades] = useState<T[]>([]);
+  const [trades, setTrades] = useState<PaperTrade[]>([]);
 
-  const [selected, setSelected] = useState<S | null>(null);
+  const [selected, setSelected] = useState<Signal | null>(null);
   const [explain, setExplain] = useState('');
   const [busyExplain, setBusyExplain] = useState(false);
 
   const busy = useRef(false);
+  const mounted = useRef(true);
 
   const scan = useCallback(async () => {
     if (busy.current) return;
@@ -77,7 +96,7 @@ export function QuantAIEngine() {
     setError('');
 
     try {
-      const [u, s] = await Promise.all([
+      const [universeResponse, scanResponse] = await Promise.all([
         fetch('/api/quant/universe', {
           cache: 'no-store',
         }),
@@ -86,84 +105,111 @@ export function QuantAIEngine() {
         }),
       ]);
 
-      const ud = await u.json();
-      const sd = await s.json();
+      const [universeData, scanData] = await Promise.all([
+        readJson(universeResponse),
+        readJson(scanResponse),
+      ]);
 
-      if (!u.ok || !ud.success) {
-        throw Error(ud.message || 'Market list failed');
-      }
+      if (!mounted.current) return;
 
-      if (!s.ok || !sd.success) {
-        throw Error(sd.message || 'Scanner failed');
-      }
+      setMarkets(Number(universeData.count) || 0);
+      setSignals(
+        Array.isArray(scanData.signals)
+          ? scanData.signals
+          : []
+      );
+    } catch (err) {
+      if (!mounted.current) return;
 
-      setMarkets(ud.count);
-      setSignals(sd.signals || []);
-    } catch (e: any) {
-      setError(e.message || 'Quant scanner unavailable');
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Quant scanner unavailable'
+      );
     } finally {
       busy.current = false;
-      setLoading(false);
+
+      if (mounted.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
+    mounted.current = true;
+
     void scan();
 
-    const id = setInterval(() => void scan(), 60000);
+    const interval = setInterval(() => {
+      void scan();
+    }, 60000);
 
-    return () => clearInterval(id);
+    return () => {
+      mounted.current = false;
+      clearInterval(interval);
+    };
   }, [scan]);
 
-  const rows = useMemo(
-    () =>
-      signals
-        .filter(s =>
-          s.symbol.toLowerCase().includes(search.toLowerCase())
-        )
-        .sort((a, b) =>
-          sort === 'volume'
-            ? b.quoteVolume - a.quoteVolume
-            : sort === 'change'
-              ? b.change24h - a.change24h
-              : Math.abs(b.score) - Math.abs(a.score)
-        ),
-    [signals, search, sort]
+  const rows = useMemo(() => {
+    const filtered = signals.filter(signal =>
+      signal.symbol.toLowerCase().includes(search.toLowerCase())
+    );
+
+    return filtered.sort((a, b) => {
+      if (sort === 'volume') {
+        return b.quoteVolume - a.quoteVolume;
+      }
+
+      if (sort === 'change') {
+        return b.change24h - a.change24h;
+      }
+
+      return Math.abs(b.score) - Math.abs(a.score);
+    });
+  }, [signals, search, sort]);
+
+  const openTrades = trades.filter(
+    trade => trade.status === 'OPEN'
   );
 
-  const open = trades.filter(t => t.status === 'OPEN');
-  const closed = trades.filter(t => t.status !== 'OPEN');
+  const closedTrades = trades.filter(
+    trade => trade.status !== 'OPEN'
+  );
 
-  const pnl = closed.reduce(
-    (v, t) => v + (t.pnl || 0),
+  const totalPnl = closedTrades.reduce(
+    (total, trade) => total + (trade.pnl || 0),
     0
   );
 
-  const discuss = async (s: S) => {
-    setSelected(s);
+  const discuss = async (signal: Signal) => {
+    setSelected(signal);
     setExplain('');
     setBusyExplain(true);
 
     try {
-      const r = await fetch('/api/quant/discuss', {
+      const response = await fetch('/api/quant/discuss', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          analysis: s,
+          analysis: signal,
         }),
       });
 
-      const d = await r.json();
+      const data = await readJson(response);
 
       setExplain(
-        d.discussion ||
-        d.message ||
-        'No explanation available'
+        data.discussion ||
+        data.message ||
+        'No explanation available.'
       );
-    } catch (e: any) {
-      setExplain(e.message);
+    } catch (err) {
+      setExplain(
+        err instanceof Error
+          ? err.message
+          : 'Unable to load signal explanation.'
+      );
     } finally {
       setBusyExplain(false);
     }
@@ -172,87 +218,97 @@ export function QuantAIEngine() {
   useEffect(() => {
     if (!bot) return;
 
-    const id = setInterval(() => {
-      setTrades(prev => {
-        let next = prev.map(t => {
-          if (t.status !== 'OPEN') return t;
+    const interval = setInterval(() => {
+      setTrades(previous => {
+        let next = previous.map(trade => {
+          if (trade.status !== 'OPEN') return trade;
 
-          const s = signals.find(
-            x => x.symbol === t.symbol
+          const signal = signals.find(
+            item => item.symbol === trade.symbol
           );
 
-          if (!s) return t;
+          if (!signal || signal.price <= 0) return trade;
 
-          const hitSL =
-            t.side === 'BUY'
-              ? s.price <= t.stop
-              : s.price >= t.stop;
+          const hitStop =
+            trade.side === 'BUY'
+              ? signal.price <= trade.stop
+              : signal.price >= trade.stop;
 
-          const hitTP =
-            t.side === 'BUY'
-              ? s.price >= t.target
-              : s.price <= t.target;
+          const hitTarget =
+            trade.side === 'BUY'
+              ? signal.price >= trade.target
+              : signal.price <= trade.target;
 
-          if (!hitSL && !hitTP) return t;
+          if (!hitStop && !hitTarget) return trade;
 
-          const exit = hitSL ? t.stop : t.target;
+          const exitPrice = hitStop
+            ? trade.stop
+            : trade.target;
 
-          const move =
-            t.side === 'BUY'
-              ? (exit - t.entry) / t.entry
-              : (t.entry - exit) / t.entry;
+          const movement =
+            trade.side === 'BUY'
+              ? (exitPrice - trade.entry) / trade.entry
+              : (trade.entry - exitPrice) / trade.entry;
 
           return {
-            ...t,
-            status: hitSL ? 'SL' : 'TP',
-            pnl: t.notional * move,
-          } as T;
+            ...trade,
+            status: hitStop ? 'SL' : 'TP',
+            pnl: trade.notional * movement,
+          } as PaperTrade;
         });
 
-        const openCount = next.filter(
-          t => t.status === 'OPEN'
+        const currentOpen = next.filter(
+          trade => trade.status === 'OPEN'
         ).length;
 
-        if (
-          openCount >=
-          Math.min(5, Math.max(1, Number(maxOpen) || 1))
-        ) {
+        const openLimit = Math.min(
+          5,
+          Math.max(1, Number(maxOpen) || 1)
+        );
+
+        if (currentOpen >= openLimit) {
           return next;
         }
 
-        const candidate = signals.find(
-          s =>
-            s.direction !== 'NEUTRAL' &&
-            Math.abs(s.score) >= 55 &&
-            s.confidence >= 72 &&
-            s.volatilityPct > 0.03 &&
-            s.volatilityPct < 4 &&
-            !next.some(
-              t =>
-                t.symbol === s.symbol &&
-                t.status === 'OPEN'
-            )
+        const candidate = signals.find(signal =>
+          signal.direction !== 'NEUTRAL' &&
+          Math.abs(signal.score) >= 55 &&
+          signal.confidence >= 72 &&
+          signal.volatilityPct > 0.03 &&
+          signal.volatilityPct < 4 &&
+          signal.price > 0 &&
+          !next.some(
+            trade =>
+              trade.symbol === signal.symbol &&
+              trade.status === 'OPEN'
+          )
         );
 
         if (!candidate) return next;
 
         const side = candidate.direction as 'BUY' | 'SELL';
 
-        const newTrade: T = {
+        const notional = Math.min(
+          100,
+          Math.max(5, Number(size) || 25)
+        );
+
+        const stop =
+          candidate.stopLoss ||
+          candidate.price * (side === 'BUY' ? 0.99 : 1.01);
+
+        const target =
+          candidate.takeProfit ||
+          candidate.price * (side === 'BUY' ? 1.02 : 0.98);
+
+        const newTrade: PaperTrade = {
           id: Date.now(),
           symbol: candidate.symbol,
           side,
           entry: candidate.price,
-          stop:
-            candidate.stopLoss ||
-            candidate.price * (side === 'BUY' ? 0.99 : 1.01),
-          target:
-            candidate.takeProfit ||
-            candidate.price * (side === 'BUY' ? 1.02 : 0.98),
-          notional: Math.min(
-            100,
-            Math.max(5, Number(size) || 25)
-          ),
+          stop,
+          target,
+          notional,
           status: 'OPEN',
         };
 
@@ -260,7 +316,7 @@ export function QuantAIEngine() {
       });
     }, 15000);
 
-    return () => clearInterval(id);
+    return () => clearInterval(interval);
   }, [bot, signals, size, maxOpen]);
 
   return (
@@ -273,7 +329,7 @@ export function QuantAIEngine() {
           </h2>
 
           <p className="mt-1 text-[10px] text-slate-400">
-            All active Binance USDⓈ-M USDT perpetuals ·
+            Binance USDⓈ-M USDT perpetual markets ·
             multi-factor 15m scanner
           </p>
         </div>
@@ -286,7 +342,7 @@ export function QuantAIEngine() {
           <button
             onClick={() => void scan()}
             disabled={loading}
-            className="rounded-lg border border-slate-700 px-3 py-2 text-[10px]"
+            className="rounded-lg border border-slate-700 px-3 py-2 text-[10px] disabled:opacity-50"
           >
             {loading ? 'SCANNING…' : 'RESCAN ↻'}
           </button>
@@ -298,14 +354,16 @@ export function QuantAIEngine() {
           ['ANALYSED', signals.length],
           ['BUY', signals.filter(s => s.direction === 'BUY').length],
           ['SELL', signals.filter(s => s.direction === 'SELL').length],
-          ['OPEN PAPER', open.length],
-        ].map(([k, v]) => (
+          ['OPEN PAPER', openTrades.length],
+        ].map(([label, value]) => (
           <div
-            key={String(k)}
+            key={String(label)}
             className="rounded-lg border border-slate-800 bg-slate-900 p-3"
           >
-            <p className="text-[9px] text-slate-500">{k}</p>
-            <p className="mt-1 text-lg font-black text-white">{v}</p>
+            <p className="text-[9px] text-slate-500">{label}</p>
+            <p className="mt-1 text-lg font-black text-white">
+              {value}
+            </p>
           </div>
         ))}
       </div>
@@ -313,14 +371,14 @@ export function QuantAIEngine() {
       <div className="flex flex-wrap gap-2">
         <input
           value={search}
-          onChange={e => setSearch(e.target.value)}
+          onChange={event => setSearch(event.target.value)}
           placeholder="Search any contract…"
           className="min-w-[180px] flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs"
         />
 
         <select
           value={sort}
-          onChange={e => setSort(e.target.value)}
+          onChange={event => setSort(event.target.value)}
           className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs"
         >
           <option value="score">Strongest score</option>
@@ -348,29 +406,66 @@ export function QuantAIEngine() {
                 'SCORE',
                 'SIGNAL',
                 'REVIEW',
-              ].map(x => (
-                <th key={x} className="p-3">{x}</th>
+              ].map(heading => (
+                <th key={heading} className="p-3">
+                  {heading}
+                </th>
               ))}
             </tr>
           </thead>
 
           <tbody>
-            {rows.map(s => (
-              <tr key={s.symbol} className="border-t border-slate-800">
-                <td className="p-3 font-bold text-white">{s.symbol}</td>
-                <td className="p-3">{price(s.price)}</td>
-                <td className={`p-3 ${s.change24h >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {s.change24h.toFixed(2)}%
+            {rows.map(signal => (
+              <tr
+                key={signal.symbol}
+                className="border-t border-slate-800"
+              >
+                <td className="p-3 font-bold text-white">
+                  {signal.symbol}
                 </td>
-                <td className="p-3">{compact(s.quoteVolume)}</td>
-                <td className="p-3">{s.rsi}</td>
+
+                <td className="p-3">
+                  {formatPrice(signal.price)}
+                </td>
+
+                <td
+                  className={`p-3 ${
+                    signal.change24h >= 0
+                      ? 'text-emerald-400'
+                      : 'text-rose-400'
+                  }`}
+                >
+                  {signal.change24h.toFixed(2)}%
+                </td>
+
+                <td className="p-3">
+                  {compact(signal.quoteVolume)}
+                </td>
+
+                <td className="p-3">
+                  {signal.rsi.toFixed(1)}
+                </td>
+
                 <td className="p-3 font-bold">
-                  {s.score > 0 ? '+' : ''}{s.score}
+                  {signal.score > 0 ? '+' : ''}
+                  {signal.score}
                 </td>
-                <td className="p-3">{s.direction}</td>
+
+                <td
+                  className={`p-3 font-bold ${
+                    signal.direction === 'BUY'
+                      ? 'text-emerald-400'
+                      : signal.direction === 'SELL'
+                        ? 'text-rose-400'
+                        : 'text-slate-400'
+                  }`}
+                >
+                  {signal.direction}
+                </td>
+
                 <td className="p-3">
                   <button
-                    onClick={() => void discuss(s)}
+                    onClick={() => void discuss(signal)}
                     className="text-cyan-300 underline"
                   >
                     Discuss
@@ -378,6 +473,17 @@ export function QuantAIEngine() {
                 </td>
               </tr>
             ))}
+
+            {!loading && rows.length === 0 && (
+              <tr>
+                <td
+                  colSpan={8}
+                  className="p-6 text-center text-slate-500"
+                >
+                  No matching signals found.
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -396,10 +502,10 @@ export function QuantAIEngine() {
           </div>
 
           <p className="text-[10px] text-slate-400">
-            Runs on scanner signals every 15 seconds.
-            Uses ATR-based stop/target levels and a strict
-            open-position cap. Paper only; does not call
-            the Binance order endpoint.
+            Simulates entries from scanner signals every
+            15 seconds. Uses scanner stop-loss and
+            take-profit levels. Paper trading only.
+            This does not submit Binance orders.
           </p>
 
           <div className="grid grid-cols-2 gap-2">
@@ -410,7 +516,7 @@ export function QuantAIEngine() {
                 min="5"
                 max="100"
                 value={size}
-                onChange={e => setSize(e.target.value)}
+                onChange={event => setSize(event.target.value)}
                 className="mt-1 w-full rounded bg-slate-900 p-2 text-white"
               />
             </label>
@@ -422,14 +528,14 @@ export function QuantAIEngine() {
                 min="1"
                 max="5"
                 value={maxOpen}
-                onChange={e => setMaxOpen(e.target.value)}
+                onChange={event => setMaxOpen(event.target.value)}
                 className="mt-1 w-full rounded bg-slate-900 p-2 text-white"
               />
             </label>
           </div>
 
           <button
-            onClick={() => setBot(v => !v)}
+            onClick={() => setBot(value => !value)}
             className={`w-full rounded-lg p-3 text-xs font-black ${
               bot
                 ? 'border border-rose-500/40 bg-rose-500/10 text-rose-300'
@@ -441,11 +547,17 @@ export function QuantAIEngine() {
 
           <div className="flex justify-between text-[10px]">
             <span className="text-slate-400">
-              Closed trades: {closed.length}
+              Closed trades: {closedTrades.length}
             </span>
 
-            <span className={pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}>
-              Simulated PnL: {price(pnl)}
+            <span
+              className={
+                totalPnl >= 0
+                  ? 'text-emerald-300'
+                  : 'text-rose-300'
+              }
+            >
+              Simulated PnL: {formatPrice(totalPnl)}
             </span>
           </div>
         </div>
@@ -458,7 +570,8 @@ export function QuantAIEngine() {
           {selected ? (
             <>
               <p className="text-sm font-bold text-cyan-300">
-                {selected.symbol} · {selected.direction} · score {selected.score}
+                {selected.symbol} · {selected.direction} ·
+                score {selected.score}
               </p>
 
               <p className="text-[10px] text-slate-400">
@@ -466,12 +579,15 @@ export function QuantAIEngine() {
               </p>
 
               <p className="text-[10px] leading-relaxed text-slate-200">
-                {busyExplain ? 'Reviewing indicators…' : explain}
+                {busyExplain
+                  ? 'Reviewing indicators…'
+                  : explain}
               </p>
             </>
           ) : (
             <p className="text-[10px] text-slate-500">
-              Choose Discuss on a signal to see its evidence and limitations.
+              Choose Discuss on a signal to review its
+              evidence and limitations.
             </p>
           )}
         </div>
@@ -482,28 +598,35 @@ export function QuantAIEngine() {
           PAPER TRADE JOURNAL
         </h3>
 
-        {trades.slice(0, 10).map(t => (
+        {trades.slice(0, 10).map(trade => (
           <div
-            key={t.id}
+            key={trade.id}
             className="flex flex-wrap justify-between gap-2 border-b border-slate-800 py-2 text-[10px]"
           >
             <span>
-              {t.symbol} {t.side} · {t.notional} USDT
+              {trade.symbol} {trade.side} ·
+              {trade.notional} USDT
             </span>
 
             <span>
-              Entry {price(t.entry)} / SL {price(t.stop)} / TP {price(t.target)}
+              Entry {formatPrice(trade.entry)} /
+              SL {formatPrice(trade.stop)} /
+              TP {formatPrice(trade.target)}
             </span>
 
-            <span className={
-              t.status === 'OPEN'
-                ? 'text-amber-300'
-                : (t.pnl || 0) >= 0
-                  ? 'text-emerald-300'
-                  : 'text-rose-300'
-            }>
-              {t.status}
-              {t.pnl !== undefined ? ' · ' + price(t.pnl) : ''}
+            <span
+              className={
+                trade.status === 'OPEN'
+                  ? 'text-amber-300'
+                  : (trade.pnl || 0) >= 0
+                    ? 'text-emerald-300'
+                    : 'text-rose-300'
+              }
+            >
+              {trade.status}
+              {trade.pnl !== undefined
+                ? ' · ' + formatPrice(trade.pnl)
+                : ''}
             </span>
           </div>
         ))}

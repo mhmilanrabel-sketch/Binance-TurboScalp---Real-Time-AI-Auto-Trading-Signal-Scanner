@@ -1,431 +1,614 @@
+import type { Express, Request, Response } from "express";
+import axios from "axios";
 
-import type { Express, Request, Response } from 'express';
-import axios from 'axios';
+const BINANCE_DEMO_API = "https://demo-fapi.binance.com";
 
-const BASE = 'https://demo-fapi.binance.com';
-
-let cache: { at: number; markets: any[] } = {
-  at: 0,
-  markets: [],
+type Market = {
+  symbol: string;
+  quoteVolume: number;
+  priceChangePercent: number;
+  lastPrice: number;
 };
 
-const n = (v: any) =>
-  Number.isFinite(Number(v)) ? Number(v) : 0;
-
-const ema = (x: number[], p: number) => {
-  if (!x.length) return [];
-
-  const k = 2 / (p + 1);
-  const o = [x[0]];
-
-  for (let i = 1; i < x.length; i++) {
-    o.push(x[i] * k + o[i - 1] * (1 - k));
-  }
-
-  return o;
+type Signal = {
+  symbol: string;
+  direction: "BUY" | "SELL" | "NEUTRAL";
+  score: number;
+  confidence: number;
+  price: number;
+  change24h: number;
+  quoteVolume: number;
+  rsi: number;
+  volumeRatio: number;
+  volatilityPct: number;
+  stopLoss: number;
+  takeProfit: number;
+  reasons: string[];
 };
 
-function rsi(x: number[], p = 14) {
-  const o = Array(x.length).fill(50);
+let universeCache: {
+  time: number;
+  markets: Market[];
+} | null = null;
 
-  if (x.length <= p) return o;
+const CACHE_DURATION = 15_000;
 
-  let g = 0;
-  let l = 0;
-
-  for (let i = 1; i <= p; i++) {
-    const d = x[i] - x[i - 1];
-    g += Math.max(0, d);
-    l += Math.max(0, -d);
-  }
-
-  let ag = g / p;
-  let al = l / p;
-
-  o[p] = al === 0 ? 100 : 100 - 100 / (1 + ag / al);
-
-  for (let i = p + 1; i < x.length; i++) {
-    const d = x[i] - x[i - 1];
-
-    ag = (ag * (p - 1) + Math.max(0, d)) / p;
-    al = (al * (p - 1) + Math.max(0, -d)) / p;
-
-    o[i] = al === 0 ? 100 : 100 - 100 / (1 + ag / al);
-  }
-
-  return o;
+function number(value: unknown): number {
+  const result = Number(value);
+  return Number.isFinite(result) ? result : 0;
 }
 
-function calc(
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function ema(values: number[], period: number): number[] {
+  if (!values.length) return [];
+
+  const multiplier = 2 / (period + 1);
+  const output: number[] = [];
+
+  let previous = values[0];
+  output.push(previous);
+
+  for (let i = 1; i < values.length; i++) {
+    previous =
+      values[i] * multiplier +
+      previous * (1 - multiplier);
+
+    output.push(previous);
+  }
+
+  return output;
+}
+
+function calculateRSI(
+  closes: number[],
+  period = 14
+): number {
+  if (closes.length <= period) return 50;
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const difference = closes[i] - closes[i - 1];
+
+    if (difference > 0) gains += difference;
+    else losses += Math.abs(difference);
+  }
+
+  if (losses === 0) return 100;
+
+  const averageGain = gains / period;
+  const averageLoss = losses / period;
+
+  const rs = averageGain / averageLoss;
+
+  return 100 - 100 / (1 + rs);
+}
+
+async function getUniverse(): Promise<Market[]> {
+  if (
+    universeCache &&
+    Date.now() - universeCache.time < CACHE_DURATION
+  ) {
+    return universeCache.markets;
+  }
+
+  const [exchangeResponse, tickerResponse] =
+    await Promise.all([
+      axios.get(`${BINANCE_DEMO_API}/fapi/v1/exchangeInfo`, {
+        timeout: 15_000,
+      }),
+      axios.get(`${BINANCE_DEMO_API}/fapi/v1/ticker/24hr`, {
+        timeout: 15_000,
+      }),
+    ]);
+
+  const exchangeSymbols =
+    exchangeResponse.data?.symbols ?? [];
+
+  const tickers = tickerResponse.data ?? [];
+
+  const eligibleSymbols = new Set(
+    exchangeSymbols
+      .filter(
+        (item: any) =>
+          item.status === "TRADING" &&
+          item.contractType === "PERPETUAL" &&
+          item.quoteAsset === "USDT"
+      )
+      .map((item: any) => item.symbol)
+  );
+
+  const markets: Market[] = tickers
+    .filter((item: any) => eligibleSymbols.has(item.symbol))
+    .map((item: any) => ({
+      symbol: item.symbol,
+      quoteVolume: number(item.quoteVolume),
+      priceChangePercent: number(item.priceChangePercent),
+      lastPrice: number(item.lastPrice),
+    }))
+    .filter((item: Market) => item.lastPrice > 0)
+    .sort((a: Market, b: Market) =>
+      b.quoteVolume - a.quoteVolume
+    );
+
+  universeCache = {
+    time: Date.now(),
+    markets,
+  };
+
+  return markets;
+}
+
+async function getCandles(symbol: string): Promise<any[]> {
+  if (!/^[A-Z0-9]{2,30}USDT$/.test(symbol)) {
+    throw new Error("Invalid trading symbol");
+  }
+
+  const response = await axios.get(
+    `${BINANCE_DEMO_API}/fapi/v1/klines`,
+    {
+      params: {
+        symbol,
+        interval: "15m",
+        limit: 120,
+      },
+      timeout: 15_000,
+    }
+  );
+
+  if (!Array.isArray(response.data)) {
+    throw new Error("Invalid candle response");
+  }
+
+  return response.data;
+}
+
+function calculateSignal(
   symbol: string,
   candles: any[],
-  change24h: number,
-  quoteVolume: number
-) {
-  const close = candles.map(x => x.close);
-  const vol = candles.map(x => x.volume);
+  market: Market
+): Signal {
+  const opens = candles.map((c) => number(c[1]));
+  const highs = candles.map((c) => number(c[2]));
+  const lows = candles.map((c) => number(c[3]));
+  const closes = candles.map((c) => number(c[4]));
+  const volumes = candles.map((c) => number(c[5]));
 
-  const e9 = ema(close, 9);
-  const e21 = ema(close, 21);
-  const e50 = ema(close, 50);
+  if (closes.length < 60) {
+    throw new Error("Not enough candle data");
+  }
 
-  const rv = rsi(close);
+  const currentPrice = closes[closes.length - 1];
 
-  const fast = ema(close, 12);
-  const slow = ema(close, 26);
+  const ema9 = ema(closes, 9);
+  const ema21 = ema(closes, 21);
+  const ema50 = ema(closes, 50);
 
-  const macd = fast.map((v, i) => v - slow[i]);
-  const sig = ema(macd, 9);
+  const currentEma9 = ema9[ema9.length - 1];
+  const currentEma21 = ema21[ema21.length - 1];
+  const currentEma50 = ema50[ema50.length - 1];
 
-  const tr = candles.map((x, i) =>
-    i
-      ? Math.max(
-          x.high - x.low,
-          Math.abs(x.high - candles[i - 1].close),
-          Math.abs(x.low - candles[i - 1].close)
-        )
-      : x.high - x.low
+  const rsi = calculateRSI(closes);
+
+  const macdFast = ema(closes, 12);
+  const macdSlow = ema(closes, 26);
+
+  const macdValues = closes.map(
+    (_, index) => macdFast[index] - macdSlow[index]
   );
 
-  const a = ema(tr, 14);
-  const i = close.length - 1;
-  const last = close[i];
+  const macdSignal = ema(macdValues, 9);
 
-  const av =
-    vol.slice(Math.max(0, i - 20), i)
-      .reduce((s, v) => s + v, 0) /
-    Math.max(1, Math.min(20, i));
+  const currentMACD =
+    macdValues[macdValues.length - 1];
 
-  const vr = av ? vol[i] / av : 1;
+  const currentMACDSignal =
+    macdSignal[macdSignal.length - 1];
 
-  const hi = Math.max(
-    ...candles.slice(-21, -1).map(x => x.high)
+  const trueRanges: number[] = [];
+
+  for (let i = 1; i < closes.length; i++) {
+    trueRanges.push(
+      Math.max(
+        highs[i] - lows[i],
+        Math.abs(highs[i] - closes[i - 1]),
+        Math.abs(lows[i] - closes[i - 1])
+      )
+    );
+  }
+
+  const atrValues = ema(trueRanges, 14);
+  const atr = atrValues[atrValues.length - 1];
+
+  const volatilityPct =
+    currentPrice > 0
+      ? (atr / currentPrice) * 100
+      : 0;
+
+  const recentVolumes = volumes.slice(-20);
+  const averageVolume =
+    recentVolumes.reduce((sum, value) => sum + value, 0) /
+    Math.max(recentVolumes.length, 1);
+
+  const currentVolume = volumes[volumes.length - 1];
+
+  const volumeRatio =
+    averageVolume > 0
+      ? currentVolume / averageVolume
+      : 0;
+
+  const previousHigh = Math.max(
+    ...highs.slice(-21, -1)
   );
 
-  const lo = Math.min(
-    ...candles.slice(-21, -1).map(x => x.low)
+  const previousLow = Math.min(
+    ...lows.slice(-21, -1)
   );
 
-  const trend =
-    e9[i] > e21[i] && e21[i] > e50[i]
-      ? 1
-      : e9[i] < e21[i] && e21[i] < e50[i]
-        ? -1
-        : 0;
+  let score = 0;
+  const reasons: string[] = [];
 
-  const mom =
-    macd[i] > sig[i] && macd[i] > macd[i - 1]
-      ? 1
-      : macd[i] < sig[i] && macd[i] < macd[i - 1]
-        ? -1
-        : 0;
+  // Trend
+  if (
+    currentEma9 > currentEma21 &&
+    currentEma21 > currentEma50
+  ) {
+    score += 35;
+    reasons.push("Strong bullish EMA alignment");
+  } else if (
+    currentEma9 < currentEma21 &&
+    currentEma21 < currentEma50
+  ) {
+    score -= 35;
+    reasons.push("Strong bearish EMA alignment");
+  }
 
-  const br = last > hi ? 1 : last < lo ? -1 : 0;
+  // MACD
+  if (currentMACD > currentMACDSignal) {
+    score += 20;
+    reasons.push("Bullish MACD momentum");
+  } else {
+    score -= 20;
+    reasons.push("Bearish MACD momentum");
+  }
 
-  const rs =
-    rv[i] >= 52 && rv[i] <= 68
-      ? 1
-      : rv[i] <= 48 && rv[i] >= 32
-        ? -1
-        : 0;
+  // Breakout
+  if (currentPrice > previousHigh) {
+    score += 15;
+    reasons.push("Price above recent resistance");
+  } else if (currentPrice < previousLow) {
+    score -= 15;
+    reasons.push("Price below recent support");
+  }
 
-  const ds =
-    change24h > 0.25
-      ? 1
-      : change24h < -0.25
-        ? -1
-        : 0;
+  // RSI
+  if (rsi >= 50 && rsi < 70) {
+    score += 15;
+    reasons.push("Positive RSI momentum");
+  } else if (rsi < 50 && rsi > 30) {
+    score -= 15;
+    reasons.push("Negative RSI momentum");
+  } else if (rsi >= 70) {
+    score -= 5;
+    reasons.push("RSI potentially overbought");
+  } else if (rsi <= 30) {
+    score += 5;
+    reasons.push("RSI potentially oversold");
+  }
 
-  const score = Math.round(
-    35 * trend +
-    20 * mom +
-    15 * br +
-    15 * rs +
-    5 * (vr >= 1.15 ? 1 : 0) +
-    10 * ds
+  // Volume
+  if (volumeRatio > 1.5) {
+    score += currentPrice > opens[opens.length - 1] ? 5 : -5;
+    reasons.push("Above-average trading volume");
+  }
+
+  // 24-hour momentum
+  const change24h = market.priceChangePercent;
+
+  if (change24h > 2) {
+    score += 10;
+    reasons.push("Positive 24-hour momentum");
+  } else if (change24h < -2) {
+    score -= 10;
+    reasons.push("Negative 24-hour momentum");
+  }
+
+  score = clamp(score, -100, 100);
+
+  let direction: Signal["direction"] = "NEUTRAL";
+
+  if (score >= 45) direction = "BUY";
+  if (score <= -45) direction = "SELL";
+
+  const stopDistance = Math.max(
+    atr * 1.5,
+    currentPrice * 0.002
   );
-
-  const direction =
-    score >= 45
-      ? 'BUY'
-      : score <= -45
-        ? 'SELL'
-        : 'NEUTRAL';
-
-  const distance = Math.max(a[i] * 1.5, last * 0.002);
 
   const stopLoss =
-    direction === 'BUY'
-      ? last - distance
-      : direction === 'SELL'
-        ? last + distance
-        : null;
+    direction === "BUY"
+      ? currentPrice - stopDistance
+      : currentPrice + stopDistance;
 
   const takeProfit =
-    direction === 'BUY'
-      ? last + distance * 2
-      : direction === 'SELL'
-        ? last - distance * 2
-        : null;
+    direction === "BUY"
+      ? currentPrice + stopDistance * 2
+      : currentPrice - stopDistance * 2;
+
+  // This is a heuristic score, NOT a statistically validated
+  // probability of a successful trade.
+  const confidence = Math.round(
+    clamp(50 + Math.abs(score) * 0.45, 50, 95)
+  );
 
   return {
     symbol,
     direction,
     score,
-    confidence: Math.min(
-      95,
-      Math.round(50 + Math.abs(score) * 0.45)
-    ),
-    price: last,
+    confidence,
+    price: currentPrice,
     change24h,
-    quoteVolume,
-    rsi: +rv[i].toFixed(2),
-    ema9: e9[i],
-    ema21: e21[i],
-    ema50: e50[i],
-    macdHistogram: macd[i] - sig[i],
-    volumeRatio: +vr.toFixed(2),
-    volatilityPct: +(a[i] / last * 100).toFixed(3),
-    support: lo,
-    resistance: hi,
+    quoteVolume: market.quoteVolume,
+    rsi,
+    volumeRatio,
+    volatilityPct,
     stopLoss,
     takeProfit,
-    reasons: [
-      trend ? 'EMA 9/21/50 trend alignment' : 'EMA trend mixed',
-      mom ? 'MACD momentum confirms' : 'MACD not confirmed',
-      br ? '20-candle breakout' : 'No 20-candle breakout',
-      'RSI ' + rv[i].toFixed(1) +
-        ' · relative volume ' + vr.toFixed(2) + 'x',
-    ],
+    reasons,
   };
 }
 
-async function universe() {
-  if (
-    Date.now() - cache.at < 15000 &&
-    cache.markets.length
-  ) {
-    return cache.markets;
-  }
+async function runWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<R>
+): Promise<{
+  results: R[];
+  failed: number;
+}> {
+  const results: R[] = [];
+  let failed = 0;
+  let index = 0;
 
-  const [info, tick] = await Promise.all([
-    axios.get(BASE + '/fapi/v1/exchangeInfo', {
-      timeout: 12000,
-    }),
-    axios.get(BASE + '/fapi/v1/ticker/24hr', {
-      timeout: 12000,
-    }),
-  ]);
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (true) {
+        const currentIndex = index++;
 
-  const map = new Map(
-    (tick.data as any[]).map(t => [t.symbol, t])
-  );
+        if (currentIndex >= items.length) return;
 
-  cache.markets = (info.data.symbols as any[])
-    .filter(
-      s =>
-        s.status === 'TRADING' &&
-        s.contractType === 'PERPETUAL' &&
-        s.quoteAsset === 'USDT'
-    )
-    .map(s => {
-      const t: any = map.get(s.symbol);
-
-      return {
-        symbol: s.symbol,
-        baseAsset: s.baseAsset,
-        price: n(t?.lastPrice),
-        change24h: n(t?.priceChangePercent),
-        quoteVolume: n(t?.quoteVolume),
-        high24h: n(t?.highPrice),
-        low24h: n(t?.lowPrice),
-      };
-    })
-    .filter(m => m.price > 0)
-    .sort((a, b) => b.quoteVolume - a.quoteVolume);
-
-  cache.at = Date.now();
-
-  return cache.markets;
-}
-
-async function candles(symbol: string) {
-  if (!/^[A-Z0-9]{5,20}$/.test(symbol)) {
-    throw Error('Invalid symbol');
-  }
-
-  const r = await axios.get(
-    BASE + '/fapi/v1/klines',
-    {
-      params: {
-        symbol,
-        interval: '15m',
-        limit: 120,
-      },
-      timeout: 12000,
+        try {
+          results[currentIndex] = await worker(
+            items[currentIndex]
+          );
+        } catch {
+          failed++;
+        }
+      }
     }
   );
 
-  return (r.data as any[]).map(k => ({
-    open: n(k[1]),
-    high: n(k[2]),
-    low: n(k[3]),
-    close: n(k[4]),
-    volume: n(k[5]),
-  }));
+  await Promise.all(workers);
+
+  return {
+    results: results.filter(Boolean),
+    failed,
+  };
+}
+
+function sendError(
+  res: Response,
+  error: unknown,
+  message: string
+) {
+  console.error(message, error);
+
+  res.status(502).json({
+    success: false,
+    error: message,
+  });
 }
 
 export function registerQuantRoutes(app: Express) {
-  app.get('/api/quant/universe', async (_q: Request, res: Response) => {
+  // Full eligible USDT perpetual market list.
+  app.get("/api/quant/universe", async (_req, res) => {
     try {
-      const markets = await universe();
+      const markets = await getUniverse();
 
       res.json({
         success: true,
         count: markets.length,
         markets,
-        updatedAt: Date.now(),
-        environment: 'USD_M_FUTURES_DEMO',
       });
-    } catch (e: any) {
-      res.status(502).json({
-        success: false,
-        message: e?.response?.data?.msg ||
-          e.message ||
-          'Universe unavailable',
-      });
+    } catch (error) {
+      sendError(res, error, "Unable to load market universe");
     }
   });
 
-  app.get('/api/quant/scan', async (req: Request, res: Response) => {
+  // Scan a selected batch of high-volume markets.
+  app.get("/api/quant/scan", async (req, res) => {
     try {
-      const m = (await universe())
-        .filter(
-          x =>
-            x.quoteVolume >=
-            Math.max(0, n(req.query.minVolume) || 250000)
-        )
-        .slice(
-          0,
-          Math.min(60, Math.max(5, n(req.query.limit) || 40))
-        );
+      const markets = await getUniverse();
 
-      let cursor = 0;
-      const out: any[] = [];
-
-      await Promise.all(
-        Array.from({ length: 5 }, async () => {
-          while (cursor < m.length) {
-            const x = m[cursor++];
-
-            try {
-              const c = await candles(x.symbol);
-
-              if (c.length >= 60) {
-                out.push(
-                  calc(
-                    x.symbol,
-                    c,
-                    x.change24h,
-                    x.quoteVolume
-                  )
-                );
-              }
-            } catch {
-              // Skip unavailable contracts.
-            }
-          }
-        })
+      const requestedLimit = Number(req.query.limit ?? 40);
+      const requestedOffset = Number(req.query.offset ?? 0);
+      const requestedMinVolume = Number(
+        req.query.minVolume ?? 250000
       );
 
-      out.sort(
+      const limit = clamp(
+        Number.isFinite(requestedLimit) ? requestedLimit : 40,
+        1,
+        100
+      );
+
+      const offset = clamp(
+        Number.isFinite(requestedOffset) ? requestedOffset : 0,
+        0,
+        markets.length
+      );
+
+      const minVolume = clamp(
+        Number.isFinite(requestedMinVolume)
+          ? requestedMinVolume
+          : 250000,
+        0,
+        1_000_000_000_000
+      );
+
+      const eligibleMarkets = markets.filter(
+        (market) => market.quoteVolume >= minVolume
+      );
+
+      const batch = eligibleMarkets.slice(
+        offset,
+        offset + limit
+      );
+
+      const scanResult = await runWithConcurrency(
+        batch,
+        5,
+        async (market) => {
+          const candles = await getCandles(market.symbol);
+
+          return calculateSignal(
+            market.symbol,
+            candles,
+            market
+          );
+        }
+      );
+
+      const signals = scanResult.results.sort(
         (a, b) => Math.abs(b.score) - Math.abs(a.score)
       );
 
       res.json({
         success: true,
-        count: out.length,
-        universeCount: (await universe()).length,
-        signals: out,
-        scannedAt: Date.now(),
-        timeframe: '15m',
-        environment: 'USD_M_FUTURES_DEMO',
+        signals,
+        eligibleCount: eligibleMarkets.length,
+        requestedCount: batch.length,
+        scannedCount: signals.length,
+        failedCount: scanResult.failed,
+        offset,
+        limit,
+        nextOffset: offset + batch.length,
+        hasMore: offset + batch.length < eligibleMarkets.length,
+        interval: "15m",
+        marketType: "USDT PERPETUAL",
       });
-    } catch (e: any) {
-      res.status(502).json({
-        success: false,
-        message: e?.response?.data?.msg ||
-          e.message ||
-          'Scan failed',
-      });
+    } catch (error) {
+      sendError(res, error, "Market scan failed");
     }
   });
 
+  // Analyse one symbol.
   app.get(
-    '/api/quant/analyze/:symbol',
-    async (req: Request, res: Response) => {
+    "/api/quant/analyze/:symbol",
+    async (req, res) => {
       try {
-        const s = String(req.params.symbol).toUpperCase();
+        const symbol = String(req.params.symbol).toUpperCase();
 
-        const m = (await universe()).find(
-          x => x.symbol === s
-        );
-
-        if (!m) {
-          res.status(404).json({
+        if (!/^[A-Z0-9]{2,30}USDT$/.test(symbol)) {
+          return res.status(400).json({
             success: false,
-            message: 'Not an active USDT perpetual.',
+            error: "Invalid symbol",
           });
-          return;
         }
 
-        const c = await candles(s);
+        const markets = await getUniverse();
 
-        res.json({
+        const market = markets.find(
+          (item) => item.symbol === symbol
+        );
+
+        if (!market) {
+          return res.status(404).json({
+            success: false,
+            error: "Symbol not found in USDT perpetual markets",
+          });
+        }
+
+        const candles = await getCandles(symbol);
+        const signal = calculateSignal(
+          symbol,
+          candles,
+          market
+        );
+
+        return res.json({
           success: true,
-          analysis: calc(
-            s,
-            c,
-            m.change24h,
-            m.quoteVolume
-          ),
-          candles: c.slice(-80),
+          signal,
         });
-      } catch (e: any) {
-        res.status(502).json({
-          success: false,
-          message: e.message || 'Analysis failed',
-        });
+      } catch (error) {
+        sendError(res, error, "Symbol analysis failed");
       }
     }
   );
 
-  app.post(
-    '/api/quant/discuss',
-    (req: Request, res: Response) => {
-      const a = req.body?.analysis;
+  // Rule-based analyst. This endpoint does not call an external AI model.
+  app.post("/api/quant/discuss", async (req, res) => {
+    try {
+      const symbol = String(req.body?.symbol ?? "").toUpperCase();
 
-      if (!a || typeof a.symbol !== 'string') {
-        res.status(400).json({
+      if (!/^[A-Z0-9]{2,30}USDT$/.test(symbol)) {
+        return res.status(400).json({
           success: false,
-          message: 'Valid analysis is required',
+          error: "Please provide a valid USDT perpetual symbol",
         });
-        return;
       }
 
-      res.json({
+      const markets = await getUniverse();
+      const market = markets.find(
+        (item) => item.symbol === symbol
+      );
+
+      if (!market) {
+        return res.status(404).json({
+          success: false,
+          error: "Symbol not found",
+        });
+      }
+
+      const candles = await getCandles(symbol);
+      const signal = calculateSignal(
+        symbol,
+        candles,
+        market
+      );
+
+      const recommendation =
+        signal.direction === "BUY"
+          ? "The indicators currently show a bullish setup."
+          : signal.direction === "SELL"
+            ? "The indicators currently show a bearish setup."
+            : "The indicators do not currently show a strong directional setup.";
+
+      const discussion = [
+        `${symbol} analysis`,
+        recommendation,
+        `Signal score: ${signal.score}/100.`,
+        `RSI: ${signal.rsi.toFixed(2)}.`,
+        `24-hour change: ${signal.change24h.toFixed(2)}%.`,
+        `Volume ratio: ${signal.volumeRatio.toFixed(2)}.`,
+        `Estimated stop: ${signal.stopLoss}.`,
+        `Estimated target: ${signal.takeProfit}.`,
+        "These are technical indicator estimates, not guaranteed predictions.",
+      ].join(" ");
+
+      return res.json({
         success: true,
-        mode: 'RULE_BASED_ANALYST',
-        discussion:
-          a.symbol + ' is ' + a.direction +
-          ' with composite score ' + a.score +
-          '. RSI ' + a.rsi +
-          ', relative volume ' + a.volumeRatio +
-          'x and MACD histogram ' +
-          Number(a.macdHistogram).toPrecision(4) +
-          '. ' + (a.reasons || []).join('; ') +
-          '. These are technical conditions, not a probability or guaranteed forecast. Check higher timeframe, spread, funding, slippage and event risk.',
+        mode: "RULE_BASED_ANALYST",
+        discussion,
+        signal,
       });
+    } catch (error) {
+      sendError(res, error, "Unable to analyse this symbol");
     }
-  );
+  });
 }
