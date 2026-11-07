@@ -29,12 +29,12 @@ async function sendTelegramAlert(message) {
   }
 }
 
-// Secure Binance Futures Proxy & Orphaned Trade Cleaner
+// Secure Binance Futures Proxy
 app.post('/api/binance-proxy', async (req, res) => {
   try {
     const { endpoint, method = 'GET', data, apiKey, secretKey } = req.body;
     const clientApiKey = apiKey || process.env.BINANCE_API_KEY;
-    const binanceUrl = `https://fapi.binance.com${endpoint}`; // Futures endpoint
+    const binanceUrl = `https://fapi.binance.com${endpoint}`;
     
     const headers = {};
     if (clientApiKey) headers['X-MBX-APIKEY'] = clientApiKey;
@@ -62,12 +62,11 @@ app.post('/api/binance/check-orphans', async (req, res) => {
     const clientApiKey = apiKey || process.env.BINANCE_API_KEY;
     const headers = clientApiKey ? { 'X-MBX-APIKEY': clientApiKey } : {};
 
-    // 1. Check open orders & positions on Binance Futures
-    const openOrdersRes = await axios.get(`https://fapi.binance.com/fapi/v1/openOrders?symbol=${symbol.replace('/', '')}`, { headers }).catch(() => ({ data: [] }));
+    const cleanSymbol = symbol.replace('/', '');
+    const openOrdersRes = await axios.get(`https://fapi.binance.com/fapi/v1/openOrders?symbol=${cleanSymbol}`, { headers }).catch(() => ({ data: [] }));
     
     if (Array.isArray(openOrdersRes.data) && openOrdersRes.data.length > 0) {
-      // Automatically cancel orphaned open orders
-      await axios.delete(`https://fapi.binance.com/fapi/v1/allOpenOrders?symbol=${symbol.replace('/', '')}`, { headers }).catch(() => {});
+      await axios.delete(`https://fapi.binance.com/fapi/v1/allOpenOrders?symbol=${cleanSymbol}`, { headers }).catch(() => {});
       console.log(`[Orphan Cleaner] Cleared ${openOrdersRes.data.length} orphaned orders for ${symbol}`);
     }
 
@@ -86,7 +85,7 @@ let activeSymbols = ['btcusdt', 'ethusdt', 'solusdt'];
 
 function connectBinanceWS(symbols) {
   const streams = symbols.map(s => `${s.toLowerCase()}@ticker`).join('/');
-  const wsUrl = `wss://fstream.binance.com/stream?streams=${streams}`; // Futures stream
+  const wsUrl = `wss://fstream.binance.com/stream?streams=${streams}`;
   
   if (binanceWs) binanceWs.terminate();
 

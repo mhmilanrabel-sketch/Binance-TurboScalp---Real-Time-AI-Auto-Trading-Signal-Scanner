@@ -3,7 +3,6 @@ import { X, Eye, EyeOff, ShieldCheck, AlertCircle } from 'lucide-react';
 
 export function ApiSettingsModal({ isOpen, onClose, settings, onSaveSettings }: any) {
   const [network, setNetwork] = useState(settings.network || 'DEMO_PAPER');
-  const [instrumentType, setInstrumentType] = useState('FUTURE'); // Only Future now
   const [apiKey, setApiKey] = useState(settings.apiKey || '');
   const [apiSecret, setApiSecret] = useState(settings.apiSecret || '');
   const [showSecret, setShowSecret] = useState(false);
@@ -20,7 +19,6 @@ export function ApiSettingsModal({ isOpen, onClose, settings, onSaveSettings }: 
         body: JSON.stringify({ endpoint: '/fapi/v2/account', apiKey, secretKey: apiSecret })
       });
 
-      // Safe JSON parsing handling to prevent Unexpected end of JSON input crash
       const text = await res.text();
       let data;
       try {
