@@ -11,7 +11,6 @@ interface ScannerMatrixProps {
   isScanning: boolean;
 }
 
-// Safe number formatting helper to prevent toFixed crashes
 const safeNum = (val: number | undefined | null, decimals: number = 2): string => {
   if (val === undefined || val === null || isNaN(val)) {
     return (0).toFixed(decimals);
@@ -118,16 +117,27 @@ export function ScannerMatrix({
                 </div>
               </div>
 
-              {/* Confluence Tags */}
+              {/* Safe Confluence Badges rendering */}
               <div className="flex flex-wrap gap-1.5">
-                {evalResult.confluences.map((conf, idx) => (
-                  <span
-                    key={idx}
-                    className="px-2 py-0.5 rounded-lg bg-slate-800/80 border border-slate-700/60 text-[10px] text-slate-300"
-                  >
-                    {conf}
-                  </span>
-                ))}
+                {Array.isArray(evalResult.confluences) &&
+                  evalResult.confluences.map((conf: any, idx: number) => {
+                    // Extract text string safely whether conf is an object or string
+                    let label = '';
+                    if (typeof conf === 'string') {
+                      label = conf;
+                    } else if (conf && typeof conf === 'object') {
+                      label = conf.name || conf.description || conf.value || JSON.stringify(conf);
+                    }
+
+                    return (
+                      <span
+                        key={idx}
+                        className="px-2 py-0.5 rounded-lg bg-slate-800/80 border border-slate-700/60 text-[10px] text-slate-300"
+                      >
+                        {label}
+                      </span>
+                    );
+                  })}
               </div>
 
               {/* Action Button */}
