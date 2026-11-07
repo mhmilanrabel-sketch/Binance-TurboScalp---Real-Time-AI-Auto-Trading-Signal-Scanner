@@ -21,6 +21,7 @@ import {
 } from './services/binanceService';
 
 import { ApiSettingsModal } from './components/ApiSettingsModal';
+import { QuantAIEngine } from './components/QuantAIEngine';
 
 // ======================================================
 // TYPES
@@ -1638,6 +1639,8 @@ export default function App() {
         max-w-[1600px] mx-auto
         px-4 lg:px-8 py-6 space-y-6
       ">
+
+        <QuantAIEngine />
 
         {/* ==================================================
             ENVIRONMENT NOTICE

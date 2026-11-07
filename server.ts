@@ -22,6 +22,7 @@ import {
 } from 'ws';
 
 import dotenv from 'dotenv';
+import { registerQuantRoutes } from './server/quantRoutes.js';
 
 dotenv.config();
 
@@ -43,6 +44,9 @@ app.set('trust proxy', 1);
 app.use(express.json({
   limit: '32kb'
 }));
+
+// Public Demo-market quant scanner and paper-bot analysis API.
+registerQuantRoutes(app);
 
 const PORT = Number(process.env.PORT || 3000);
 
