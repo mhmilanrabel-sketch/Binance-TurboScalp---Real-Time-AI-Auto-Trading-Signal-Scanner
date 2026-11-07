@@ -96,7 +96,6 @@ export default function App() {
         console.error(e);
       }
     }
-    // Pre-seed one demo active trade so users immediately see live tracking in action
     const btcAsset = INITIAL_BINANCE_ASSETS[0];
     const initialTrade = createTradeSignal(
       btcAsset,
@@ -132,38 +131,7 @@ export default function App() {
         console.error(e);
       }
     }
-    return [
-      {
-        id: 'TS-INIT-1',
-        symbol: 'BTC/USDT',
-        direction: 'BUY (LONG)',
-        timeframe: '5m',
-        entryPrice: 90800,
-        exitPrice: 91526,
-        pnlPercentage: 8.0,
-        pnlUsd: 40.0,
-        outcome: 'TP1',
-        closedAt: '05:30:15',
-        holdingTime: '4m 12s',
-        executionMode: 'AUTO_PILOT',
-        leverage: 10,
-      },
-      {
-        id: 'TS-INIT-2',
-        symbol: 'ETH/USDT',
-        direction: 'BUY (LONG)',
-        timeframe: '5m',
-        entryPrice: 3310,
-        exitPrice: 3369,
-        pnlPercentage: 18.0,
-        pnlUsd: 90.0,
-        outcome: 'TP2',
-        closedAt: '05:22:04',
-        holdingTime: '8m 45s',
-        executionMode: 'AUTO_PILOT',
-        leverage: 10,
-      },
-    ];
+    return [];
   });
 
   // Binance API settings
@@ -193,7 +161,7 @@ export default function App() {
       id: 'ALT-INIT-1',
       type: 'INFO',
       title: 'TurboScalp Engine Initialized',
-      message: 'Binance Live WebSocket connected. Auto-Pilot Scanner standing by.',
+      message: 'Binance Live WebSocket connected via AWS Proxy. Auto-Pilot Scanner standing by.',
       symbol: 'SYSTEM',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       timeMs: Date.now(),
@@ -229,7 +197,7 @@ export default function App() {
     localStorage.setItem('turboscalp_api', JSON.stringify(apiSettings));
   }, [apiSettings]);
 
-  // Push notification helper
+  // Push notification helper & Telegram trigger
   const addAlert = useCallback((alert: Omit<TradeAlert, 'id' | 'timestamp' | 'timeMs' | 'read'>) => {
     const newAlert: TradeAlert = {
       ...alert,
@@ -240,7 +208,6 @@ export default function App() {
     };
     setAlerts((prev) => [newAlert, ...prev.slice(0, 49)]);
 
-    // Try browser Notification API if granted
     if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
       try {
         new Notification(alert.title, { body: alert.message });
@@ -250,14 +217,12 @@ export default function App() {
     }
   }, []);
 
-  // Request browser notification permission once on mount
   useEffect(() => {
     if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission().catch(() => {});
     }
   }, []);
 
-  // Audio mute toggle
   const handleToggleAudio = () => {
     const next = !isMuted;
     setIsMuted(next);
@@ -265,7 +230,7 @@ export default function App() {
   };
 
   // =========================================================================
-  // 1. REAL-TIME BINANCE WEBSOCKET STREAM
+  // REAL-TIME WEBSOCKET STREAM VIA PROXY
   // =========================================================================
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -275,7 +240,8 @@ export default function App() {
 
     const connectWebSocket = () => {
       try {
-        const wsUrl = 'wss://stream.binance.com:9443/ws/!miniTicker@arr';
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}`;
         ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
@@ -287,69 +253,41 @@ export default function App() {
         ws.onmessage = (event) => {
           if (!isMounted) return;
           try {
-            const data = JSON.parse(event.data);
-            if (!Array.isArray(data)) return;
+            const parsed = JSON.parse(event.data);
+            if (!parsed.data) return;
 
-            // Map incoming tickers
-            const tickerMap: Record<string, { price: number; high: number; low: number; volume: number }> = {};
-            data.forEach((item: any) => {
-              if (item.s && item.c) {
-                tickerMap[item.s] = {
-                  price: parseFloat(item.c),
-                  high: parseFloat(item.h),
-                  low: parseFloat(item.l),
-                  volume: parseFloat(item.v),
-                };
-              }
-            });
+            const { s, c, h, l, v } = parsed.data;
+            if (!s || !c) return;
 
-            // Update assets
+            const tickerSymbol = s;
+            const priceVal = parseFloat(c);
+            const highVal = parseFloat(h);
+            const lowVal = parseFloat(l);
+
             setAssets((prev) => {
               let changed = false;
               const next = prev.map((asset) => {
                 const rawSymbol = asset.symbol.replace('/', '').toUpperCase();
-                const tick = tickerMap[rawSymbol];
-                if (!tick || tick.price <= 0) return asset;
+                if (rawSymbol !== tickerSymbol) return asset;
 
                 const prevPrice = asset.price;
-                const newPrice = tick.price;
-                if (prevPrice !== newPrice) changed = true;
+                if (prevPrice !== priceVal) changed = true;
 
-                // Adjust RSI dynamically based on tick momentum
-                const rsiShift = newPrice >= prevPrice ? 0.1 : -0.1;
+                const rsiShift = priceVal >= prevPrice ? 0.1 : -0.1;
                 const newRsi = Math.max(15, Math.min(88, Number(((asset.rsi ?? 50) + rsiShift).toFixed(1))));
 
                 return {
                   ...asset,
-                  price: newPrice,
-                  high24h: tick.high,
-                  low24h: tick.low,
+                  price: priceVal,
+                  high24h: highVal,
+                  low24h: lowVal,
                   rsi: newRsi,
                 };
               });
               return changed ? next : prev;
             });
 
-            // Check custom alerts on latest tick
-            assetsRef.current.forEach((asset) => {
-              customRules.forEach((rule) => {
-                if (checkCustomAlert(rule, asset)) {
-                  addAlert({
-                    type: 'CUSTOM_PRICE',
-                    title: `Custom Trigger: ${asset.symbol}`,
-                    message: `Condition met: ${rule.condition} at price $${asset.price}`,
-                    symbol: asset.symbol,
-                    level: 'warning',
-                  });
-                  playSignalAlert(true);
-                  setCustomRules((rules) =>
-                    rules.map((r) => (r.id === rule.id ? { ...r, triggered: true, active: false } : r))
-                  );
-                }
-              });
-            });
-
-            // Update Active Positions against newest prices!
+            // Update Active Positions
             setPositions((currentPositions) => {
               if (currentPositions.length === 0) return currentPositions;
 
@@ -359,12 +297,14 @@ export default function App() {
 
               for (const pos of currentPositions) {
                 const rawSymbol = pos.symbol.replace('/', '').toUpperCase();
-                const tick = tickerMap[rawSymbol];
-                const livePrice = tick ? tick.price : pos.currentPrice;
+                if (rawSymbol !== tickerSymbol) {
+                  remainingPositions.push(pos);
+                  continue;
+                }
 
                 const { updatedSignal, triggeredEvent } = updateActivePosition(
                   pos,
-                  livePrice,
+                  priceVal,
                   configRef.current.autoMoveBreakevenAtTp1
                 );
 
@@ -372,7 +312,7 @@ export default function App() {
                   addAlert({
                     type: 'TP_HIT',
                     title: `Take Profit 1 Reached: ${pos.symbol}`,
-                    message: `Target hit at $${livePrice}. Stop loss automatically moved to Breakeven $${pos.entryPrice}!`,
+                    message: `Target hit at $${priceVal}. Stop loss moved to Breakeven $${pos.entryPrice}!`,
                     symbol: pos.symbol,
                     level: 'success',
                   });
@@ -380,11 +320,10 @@ export default function App() {
                   remainingPositions.push(updatedSignal);
                   hasUpdates = true;
                 } else if (triggeredEvent === 'TP2' || triggeredEvent === 'TP3') {
-                  // Realize win and close
                   addAlert({
                     type: 'TP_HIT',
                     title: `Take Profit Hit: ${pos.symbol}`,
-                    message: `Full target closed at $${livePrice} with +${updatedSignal.pnlPercentage.toFixed(2)}% profit!`,
+                    message: `Full target closed at $${priceVal} with +${updatedSignal.pnlPercentage.toFixed(2)}% profit!`,
                     symbol: pos.symbol,
                     level: 'success',
                   });
@@ -395,7 +334,7 @@ export default function App() {
                     direction: pos.direction,
                     timeframe: pos.timeframe,
                     entryPrice: pos.entryPrice,
-                    exitPrice: livePrice,
+                    exitPrice: priceVal,
                     pnlPercentage: updatedSignal.pnlPercentage,
                     pnlUsd: updatedSignal.pnlUsd || 0,
                     outcome: triggeredEvent === 'TP2' ? 'TP2' : 'TP3',
@@ -406,11 +345,10 @@ export default function App() {
                   });
                   hasUpdates = true;
                 } else if (triggeredEvent === 'SL') {
-                  // Realize Stop Loss
                   addAlert({
                     type: 'SL_HIT',
                     title: `Stop Loss Triggered: ${pos.symbol}`,
-                    message: `Position protected & closed at $${livePrice} (${updatedSignal.pnlPercentage.toFixed(2)}%).`,
+                    message: `Position closed at $${priceVal} (${updatedSignal.pnlPercentage.toFixed(2)}%).`,
                     symbol: pos.symbol,
                     level: 'danger',
                   });
@@ -421,7 +359,7 @@ export default function App() {
                     direction: pos.direction,
                     timeframe: pos.timeframe,
                     entryPrice: pos.entryPrice,
-                    exitPrice: livePrice,
+                    exitPrice: priceVal,
                     pnlPercentage: updatedSignal.pnlPercentage,
                     pnlUsd: updatedSignal.pnlUsd || 0,
                     outcome: 'SL',
@@ -432,8 +370,7 @@ export default function App() {
                   });
                   hasUpdates = true;
                 } else {
-                  // Still open
-                  if (pos.currentPrice !== livePrice || pos.pnlPercentage !== updatedSignal.pnlPercentage) {
+                  if (pos.currentPrice !== priceVal || pos.pnlPercentage !== updatedSignal.pnlPercentage) {
                     hasUpdates = true;
                   }
                   remainingPositions.push(updatedSignal);
@@ -442,7 +379,6 @@ export default function App() {
 
               if (newlyClosed.length > 0) {
                 setClosedTrades((prev) => [...newlyClosed, ...prev]);
-                // Update demo balance if in demo mode
                 const netClosedPnlUsd = newlyClosed.reduce((acc, t) => acc + t.pnlUsd, 0);
                 setApiSettings((prev) => ({
                   ...prev,
@@ -476,7 +412,6 @@ export default function App() {
 
     connectWebSocket();
 
-    // Periodic heartbeat to update latency
     pingInterval = setInterval(() => {
       setLatencyMs(Math.floor(Math.random() * 12 + 18));
     }, 4000);
@@ -487,10 +422,10 @@ export default function App() {
       if (pingInterval) clearInterval(pingInterval);
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
     };
-  }, [addAlert, customRules]);
+  }, [addAlert]);
 
   // =========================================================================
-  // 2. HIGH-SPEED SCANNER & AUTO-PILOT EXECUTION ENGINE
+  // AUTO-PILOT SCANNER ENGINE
   // =========================================================================
   const executeScan = useCallback(async () => {
     const currentAssets = assetsRef.current;
@@ -508,10 +443,8 @@ export default function App() {
         return;
       }
 
-      // Set of already active symbols to prevent duplicate orders
       const activeKeys = new Set(activeTrades.map((t) => `${t.symbol}_${t.direction}`));
 
-      // Prioritize symbols in selectedPairs, with BTC first
       const eligibleAssets = currentAssets
         .filter((a) => currentConfig.selectedPairs.includes(a.symbol))
         .sort((a, b) => (a.symbol === 'BTC/USDT' ? -1 : b.symbol === 'BTC/USDT' ? 1 : 0));
@@ -523,7 +456,6 @@ export default function App() {
 
         const evalResult = evaluateMarketAsset(asset);
 
-        // Check direction filter
         if (
           currentConfig.allowedDirections === 'LONG_ONLY' &&
           evalResult.direction !== 'BUY (LONG)'
@@ -537,7 +469,6 @@ export default function App() {
           continue;
         }
 
-        // Check minimum confidence threshold
         if (evalResult.confidenceScore < currentConfig.minConfidenceScore) {
           continue;
         }
@@ -545,7 +476,6 @@ export default function App() {
         const tradeKey = `${asset.symbol}_${evalResult.direction}`;
         if (activeKeys.has(tradeKey)) continue;
 
-        // Execute Push Trade via Service
         const pushResult = await executeBinancePushOrder({
           symbol: asset.symbol,
           side: evalResult.direction === 'BUY (LONG)' ? 'BUY' : 'SELL',
@@ -567,7 +497,6 @@ export default function App() {
           newTradesToOpen.push(newSignal);
           activeKeys.add(tradeKey);
 
-          // Audio & Alert notification
           playSignalAlert(evalResult.direction === 'BUY (LONG)');
           addAlert({
             type: 'PUSH_EXECUTED',
@@ -576,6 +505,23 @@ export default function App() {
             symbol: asset.symbol,
             level: 'success',
           });
+
+          // Trigger Telegram comparison alert
+          try {
+            await fetch('/api/signals/compare', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                symbol: asset.symbol,
+                strategy: '15M Confluence Matrix Auto-Pilot',
+                price: asset.price,
+                indicatorValue: evalResult.confidenceScore,
+                threshold: currentConfig.minConfidenceScore,
+              }),
+            });
+          } catch (e) {
+            console.debug('Telegram alert dispatch err:', e);
+          }
         }
       }
 
@@ -589,7 +535,6 @@ export default function App() {
     }
   }, [apiSettings, addAlert, isScanning]);
 
-  // Automated Interval Loop
   useEffect(() => {
     if (!config.enabled) return;
 
@@ -601,9 +546,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, [config.enabled, config.scanIntervalSec, executeScan]);
 
-  // =========================================================================
-  // 3. USER ACTIONS & POSITION CONTROLS
-  // =========================================================================
+  // Position Controls
   const handleManualPushTrade = async (params: {
     symbol: string;
     direction: 'BUY (LONG)' | 'SELL (SHORT)';
@@ -647,7 +590,7 @@ export default function App() {
         pnlPercentage: 0.0,
         pnlUsd: 0.0,
         confluences: evalRes.confluences,
-        reasoning: `Manual Push Order executed directly to Binance. Real-time monitoring armed.`,
+        reasoning: `Manual Push Order executed directly to Binance.`,
         startTime: Date.now(),
         executionMode: 'MANUAL_PUSH',
         leverage: params.leverage,
@@ -690,7 +633,6 @@ export default function App() {
     setClosedTrades((prev) => [closed, ...prev]);
     setPositions((prev) => prev.filter((p) => p.id !== id));
 
-    // Update demo balance
     if (apiSettings.network === 'DEMO_PAPER') {
       setApiSettings((prev) => ({
         ...prev,
@@ -701,7 +643,7 @@ export default function App() {
     addAlert({
       type: 'INFO',
       title: `Trade Closed: ${pos.symbol}`,
-      message: `Manually closed at $${pos.currentPrice} with PnL ${pos.pnlPercentage >= 0 ? '+' : ''}${pos.pnlPercentage.toFixed(2)}% ($${pos.pnlUsd?.toFixed(2)})`,
+      message: `Manually closed at $${pos.currentPrice} with PnL ${pos.pnlPercentage >= 0 ? '+' : ''}${pos.pnlPercentage.toFixed(2)}%`,
       symbol: pos.symbol,
       level: pos.pnlPercentage >= 0 ? 'success' : 'danger',
     });
@@ -730,7 +672,6 @@ export default function App() {
           playTakeProfitSound();
           const halfSize = Math.round((p.positionSizeUsd || 500) / 2);
           const realizedUsd = (p.pnlUsd || 0) / 2;
-          // Record partial gain to closed trades
           const closedPartial: ClosedSignal = {
             id: `${p.id}-50PCT`,
             symbol: p.symbol,
@@ -747,15 +688,6 @@ export default function App() {
             leverage: p.leverage || 10,
           };
           setClosedTrades((closed) => [closedPartial, ...closed]);
-
-          addAlert({
-            type: 'TP_HIT',
-            title: `Partial Profit Secured: ${p.symbol}`,
-            message: `Closed 50% of position size ($${halfSize} USDT). Realized +$${realizedUsd.toFixed(2)}.`,
-            symbol: p.symbol,
-            level: 'success',
-          });
-
           return {
             ...p,
             positionSizeUsd: halfSize,
@@ -801,28 +733,18 @@ export default function App() {
     addAlert({
       type: 'INFO',
       title: 'Emergency Close All Executed',
-      message: `Closed all ${closedList.length} active trades with total PnL ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}.`,
+      message: `Closed all active trades with total PnL ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}.`,
       symbol: 'PANIC_CLOSE',
       level: 'warning',
     });
   };
 
-  // Performance stats calculation
-  const performanceStats = useMemo(() => {
-    return calculatePerformanceStats(closedTrades);
-  }, [closedTrades]);
-
-  const totalUnrealizedPnlUsd = useMemo(() => {
-    return positions.reduce((acc, p) => acc + (p.pnlUsd || 0), 0);
-  }, [positions]);
-
-  const unreadAlertsCount = useMemo(() => {
-    return alerts.filter((a) => !a.read).length;
-  }, [alerts]);
+  const performanceStats = useMemo(() => calculatePerformanceStats(closedTrades), [closedTrades]);
+  const totalUnrealizedPnlUsd = useMemo(() => positions.reduce((acc, p) => acc + (p.pnlUsd || 0), 0), [positions]);
+  const unreadAlertsCount = useMemo(() => alerts.filter((a) => !a.read).length, [alerts]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500 selection:text-slate-950">
-      {/* Header */}
       <Header
         activeTab={activeTab}
         onTabChange={setActiveTab}
@@ -839,19 +761,15 @@ export default function App() {
         totalPnlUsd={totalUnrealizedPnlUsd}
       />
 
-      {/* Real-time Ticker Ribbon */}
       <MarketTicker
         assets={assets}
         selectedSymbol={selectedSymbol}
         onSelectSymbol={setSelectedSymbol}
       />
 
-      {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-3 sm:p-4 space-y-4">
-        {/* TAB 1: TERMINAL / DASHBOARD */}
         {activeTab === 'dashboard' && (
           <div className="space-y-4">
-            {/* Auto-Pilot Engine Controls */}
             <AutoPilotControls
               config={config}
               onUpdateConfig={(updates) => setConfig((prev) => ({ ...prev, ...updates }))}
@@ -861,7 +779,6 @@ export default function App() {
               onCloseAllTrades={handleCloseAllTrades}
             />
 
-            {/* Candlestick Chart */}
             <CandleChart
               assets={assets}
               selectedSymbol={selectedSymbol}
@@ -873,7 +790,6 @@ export default function App() {
               }}
             />
 
-            {/* Active Push Trades Grid */}
             <ActivePositions
               positions={positions}
               onClosePosition={handleClosePosition}
@@ -881,7 +797,6 @@ export default function App() {
               onPartialTakeProfit={handlePartialTakeProfit}
             />
 
-            {/* Quick Scanner Matrix */}
             <ScannerMatrix
               assets={assets}
               onSelectSymbol={setSelectedSymbol}
@@ -895,7 +810,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: FULL AUTO-RADAR SCANNER */}
         {activeTab === 'scanner' && (
           <div className="space-y-4">
             <AutoPilotControls
@@ -923,7 +837,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: POSITIONS & TRADE MANAGEMENT */}
         {activeTab === 'positions' && (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
@@ -945,7 +858,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 4: ANALYTICS & TRACK RECORD */}
         {activeTab === 'analytics' && (
           <div className="space-y-4">
             <TrackRecord
@@ -955,7 +867,6 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 5: ALERTS & TRIGGERS */}
         {activeTab === 'alerts' && (
           <div className="space-y-4">
             <AlertsPanel
@@ -991,7 +902,6 @@ export default function App() {
         )}
       </main>
 
-      {/* Modals */}
       <PushTradeModal
         isOpen={isPushModalOpen}
         onClose={() => setIsPushModalOpen(false)}
