@@ -1,19 +1,12 @@
-export interface MarketAsset {
-  symbol: string;
-  name: string;
-  price: number;
-  high24h: number;
-  low24h: number;
-  rsi?: number;
-}
+import { MarketAsset } from '../types';
 
 export const INITIAL_BINANCE_ASSETS: MarketAsset[] = [
-  { symbol: 'BTC/USDT', name: 'Bitcoin', price: 91400.0, high24h: 92500, low24h: 89800, rsi: 58.4 },
-  { symbol: 'ETH/USDT', name: 'Ethereum', price: 3350.0, high24h: 3420, low24h: 3280, rsi: 52.1 },
-  { symbol: 'SOL/USDT', name: 'Solana', price: 194.5, high24h: 198.2, low24h: 188.0, rsi: 61.2 },
-  { symbol: 'XRP/USDT', name: 'Ripple', price: 2.35, high24h: 2.45, low24h: 2.22, rsi: 55.0 },
-  { symbol: 'ADA/USDT', name: 'Cardano', price: 0.85, high24h: 0.89, low24h: 0.82, rsi: 48.6 },
-  { symbol: 'DOGE/USDT', name: 'Dogecoin', price: 0.28, high24h: 0.30, low24h: 0.26, rsi: 64.2 },
+  { symbol: 'BTC/USDT', name: 'Bitcoin', price: 91400.0, high24h: 92500, low24h: 89800, change24h: 2.14, volume24h: '$2.8B', rsi: 58.4 },
+  { symbol: 'ETH/USDT', name: 'Ethereum', price: 3350.0, high24h: 3420, low24h: 3280, change24h: 3.42, volume24h: '$1.4B', rsi: 52.1 },
+  { symbol: 'SOL/USDT', name: 'Solana', price: 194.5, high24h: 198.2, low24h: 188.0, change24h: 4.85, volume24h: '$890M', rsi: 61.2 },
+  { symbol: 'XRP/USDT', name: 'Ripple', price: 2.35, high24h: 2.45, low24h: 2.22, change24h: 5.60, volume24h: '$640M', rsi: 55.0 },
+  { symbol: 'ADA/USDT', name: 'Cardano', price: 0.85, high24h: 0.89, low24h: 0.82, change24h: 2.30, volume24h: '$210M', rsi: 48.6 },
+  { symbol: 'DOGE/USDT', name: 'Dogecoin', price: 0.28, high24h: 0.30, low24h: 0.26, change24h: -1.25, volume24h: '$410M', rsi: 64.2 },
 ];
 
 export async function fetchBinanceKlines(symbol: string, interval: string = '15m', limit: number = 50): Promise<Array<any>> {

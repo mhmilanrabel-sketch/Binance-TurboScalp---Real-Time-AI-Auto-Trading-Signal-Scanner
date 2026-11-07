@@ -915,7 +915,7 @@ export default function App() {
         isOpen={isApiModalOpen}
         onClose={() => setIsApiModalOpen(false)}
         settings={apiSettings}
-        onSaveSettings={(newSettings) => setApiSettings(newSettings)}
+        onSaveSettings={(newSettings: any) => setApiSettings(newSettings)}
       />
 
       <RiskCalculatorModal
