@@ -1,933 +1,3063 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import {
-  MarketAsset,
-  TradeSignal,
-  AutoPilotConfig,
-  BinanceApiSettings,
-  TradeAlert,
-  CustomAlertRule,
-  ClosedSignal,
-} from './types';
-import {
-  INITIAL_BINANCE_ASSETS,
-  executeBinancePushOrder,
-} from './services/binanceService';
-import {
-  createTradeSignal,
-  updateActivePosition,
-  evaluateMarketAsset,
-  calculatePerformanceStats,
-  checkCustomAlert,
-} from './utils/tradingEngine';
-import {
-  playSignalAlert,
-  playPushTradeExecuted,
-  playTakeProfitSound,
-  playStopLossSound,
-  setAudioMuted,
-  getAudioMuted,
-} from './utils/audio';
 
-import { Header, NavTab } from './components/Header';
-import { MarketTicker } from './components/MarketTicker';
-import { AutoPilotControls } from './components/AutoPilotControls';
-import { CandleChart } from './components/CandleChart';
-import { ScannerMatrix } from './components/ScannerMatrix';
-import { ActivePositions } from './components/ActivePositions';
-import { PushTradeModal } from './components/PushTradeModal';
-import { AlertsPanel } from './components/AlertsPanel';
-import { TrackRecord } from './components/TrackRecord';
+import React, {
+  useState,
+  useEffect,
+  useMemo,
+  useCallback,
+  useRef
+} from 'react';
+
+import {
+  apiRequest,
+  getBinanceConfig,
+  getBinanceAccount,
+  getBinancePositions,
+  getBinanceOpenOrders,
+  fetchBinanceKlines,
+  validateBinanceOrder,
+  executeBinanceOrder,
+  type BinanceConnectionState,
+  type BinanceConfig
+} from './services/binanceService';
+
 import { ApiSettingsModal } from './components/ApiSettingsModal';
-import { RiskCalculatorModal } from './components/RiskCalculatorModal';
+
+// ======================================================
+// TYPES
+// ======================================================
+
+type ConnectionStatus =
+  | 'LIVE'
+  | 'RECONNECTING'
+  | 'OFFLINE';
+
+type TradingMode =
+  | 'PAPER'
+  | 'BINANCE_DEMO';
+
+type SignalType =
+  | 'BUY'
+  | 'SELL'
+  | 'NEUTRAL';
+
+interface MarketAsset {
+  symbol: string;
+  name: string;
+  price: number;
+  high24h: number;
+  low24h: number;
+  change24h: number;
+  volume24h: number;
+  rsi: number | null;
+  ema9: number | null;
+  ema21: number | null;
+  signal: SignalType;
+  updatedAt: number;
+}
+
+interface AccountData {
+  availableBalance: string;
+  totalWalletBalance: string;
+  totalUnrealizedProfit: string;
+  canTrade: boolean;
+}
+
+interface Position {
+  symbol: string;
+  positionAmt: string;
+  entryPrice: string;
+  markPrice: string;
+  unrealizedProfit: string;
+  leverage: string;
+}
+
+interface PaperOrder {
+  id: number;
+  symbol: string;
+  side: string;
+  quantityUsd: number;
+  leverage: number;
+  price: number;
+  createdAt: string;
+  status: string;
+}
+
+// ======================================================
+// MARKET SYMBOLS
+// ======================================================
+
+const SYMBOLS = [
+  { symbol: 'BTCUSDT', name: 'Bitcoin' },
+  { symbol: 'ETHUSDT', name: 'Ethereum' },
+  { symbol: 'SOLUSDT', name: 'Solana' },
+  { symbol: 'BNBUSDT', name: 'BNB' },
+  { symbol: 'XRPUSDT', name: 'XRP' },
+  { symbol: 'DOGEUSDT', name: 'Dogecoin' },
+  { symbol: 'ADAUSDT', name: 'Cardano' },
+  { symbol: 'AVAXUSDT', name: 'Avalanche' },
+  { symbol: 'LINKUSDT', name: 'Chainlink' },
+  { symbol: 'SUIUSDT', name: 'Sui' },
+  { symbol: 'NEARUSDT', name: 'NEAR' },
+  { symbol: 'PEPEUSDT', name: 'Pepe' }
+];
+
+const EMPTY_ACCOUNT: AccountData = {
+  availableBalance: '0',
+  totalWalletBalance: '0',
+  totalUnrealizedProfit: '0',
+  canTrade: false
+};
+
+// ======================================================
+// INITIAL MARKET DATA
+// ======================================================
+
+function createInitialAssets(): MarketAsset[] {
+
+  return SYMBOLS.map(item => ({
+
+    symbol: item.symbol,
+
+    name: item.name,
+
+    price: 0,
+
+    high24h: 0,
+
+    low24h: 0,
+
+    change24h: 0,
+
+    volume24h: 0,
+
+    rsi: null,
+
+    ema9: null,
+
+    ema21: null,
+
+    signal: 'NEUTRAL',
+
+    updatedAt: 0
+
+  }));
+
+}
+
+// ======================================================
+// FORMATTING
+// ======================================================
+
+function formatPrice(value: number): string {
+
+  if (!Number.isFinite(value) || value <= 0) {
+    return '—';
+  }
+
+  const decimals =
+    value >= 1000 ? 2 :
+    value >= 1 ? 4 : 7;
+
+  return '$' + value.toLocaleString('en-US', {
+
+    minimumFractionDigits: 2,
+
+    maximumFractionDigits: decimals
+
+  });
+
+}
+
+function formatMoney(value: number): string {
+
+  if (!Number.isFinite(value)) {
+    return '$0.00';
+  }
+
+  return '$' + value.toLocaleString('en-US', {
+
+    minimumFractionDigits: 2,
+
+    maximumFractionDigits: 4
+
+  });
+
+}
+
+function formatVolume(value: number): string {
+
+  if (!Number.isFinite(value)) return '—';
+
+  if (value >= 1_000_000_000) {
+
+    return '$' +
+      (value / 1_000_000_000).toFixed(2) + 'B';
+
+  }
+
+  if (value >= 1_000_000) {
+
+    return '$' +
+      (value / 1_000_000).toFixed(2) + 'M';
+
+  }
+
+  if (value >= 1000) {
+
+    return '$' +
+      (value / 1000).toFixed(2) + 'K';
+
+  }
+
+  return '$' + value.toFixed(2);
+
+}
+
+// ======================================================
+// EMA CALCULATION
+// ======================================================
+
+function calculateEMA(
+  values: number[],
+  period: number
+): number | null {
+
+  if (values.length < period) {
+    return null;
+  }
+
+  const multiplier = 2 / (period + 1);
+
+  let ema = values
+    .slice(0, period)
+    .reduce((sum, value) => sum + value, 0) / period;
+
+  for (let i = period; i < values.length; i++) {
+
+    ema =
+      (values[i] - ema) * multiplier + ema;
+
+  }
+
+  return ema;
+
+}
+
+// ======================================================
+// RSI CALCULATION
+// ======================================================
+
+function calculateRSI(
+  closes: number[],
+  period = 14
+): number | null {
+
+  if (closes.length <= period) {
+    return null;
+  }
+
+  let gains = 0;
+
+  let losses = 0;
+
+  const start = closes.length - period;
+
+  for (let i = start; i < closes.length; i++) {
+
+    const change = closes[i] - closes[i - 1];
+
+    if (change > 0) {
+
+      gains += change;
+
+    } else {
+
+      losses += Math.abs(change);
+
+    }
+
+  }
+
+  const averageGain = gains / period;
+
+  const averageLoss = losses / period;
+
+  if (averageLoss === 0) return 100;
+
+  if (averageGain === 0) return 0;
+
+  const rs = averageGain / averageLoss;
+
+  return 100 - (100 / (1 + rs));
+
+}
+
+// ======================================================
+// TECHNICAL SIGNAL
+// ======================================================
+
+function calculateSignal(
+  ema9: number,
+  ema21: number,
+  rsi: number,
+  dailyChange: number
+): SignalType {
+
+  if (
+    ema9 > ema21 &&
+    rsi >= 50 &&
+    rsi < 70 &&
+    dailyChange > 0
+  ) {
+
+    return 'BUY';
+
+  }
+
+  if (
+    ema9 < ema21 &&
+    rsi <= 50 &&
+    rsi > 30 &&
+    dailyChange < 0
+  ) {
+
+    return 'SELL';
+
+  }
+
+  return 'NEUTRAL';
+
+}
+
+// ======================================================
+// MAIN APPLICATION
+// ======================================================
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
-  const [selectedSymbol, setSelectedSymbol] = useState<string>('BTC/USDT');
 
-  // Market Assets state
-  const [assets, setAssets] = useState<MarketAsset[]>(INITIAL_BINANCE_ASSETS);
-  const assetsRef = useRef<MarketAsset[]>(INITIAL_BINANCE_ASSETS);
-  assetsRef.current = assets;
+  // ====================================================
+  // MARKET DATA STATES
+  // ====================================================
 
-  // Connection & Latency
-  const [connectionStatus, setConnectionStatus] = useState<'LIVE' | 'RECONNECTING' | 'OFFLINE'>('LIVE');
-  const [latencyMs, setLatencyMs] = useState<number>(24);
+  const [assets, setAssets] =
+    useState<MarketAsset[]>(createInitialAssets);
 
-  // Audio mute
-  const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [connectionStatus, setConnectionStatus] =
+    useState<ConnectionStatus>('RECONNECTING');
 
-  // Auto-Pilot Configuration
-  const [config, setConfig] = useState<AutoPilotConfig>(() => {
-    const saved = localStorage.getItem('turboscalp_config');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    return {
-      enabled: true,
-      scanIntervalSec: 2,
-      minConfidenceScore: 85,
-      allowedDirections: 'BOTH',
-      maxOpenTrades: 6,
-      tradeSizeUsd: 500,
-      leverage: 10,
-      tp1Percent: 0.8,
-      tp2Percent: 1.8,
-      tp3Percent: 3.0,
-      slPercent: 0.6,
-      autoMoveBreakevenAtTp1: true,
-      selectedPairs: INITIAL_BINANCE_ASSETS.map((a) => a.symbol),
-    };
-  });
+  const [search, setSearch] =
+    useState('');
 
-  const configRef = useRef(config);
-  configRef.current = config;
+  const [selectedSymbol, setSelectedSymbol] =
+    useState('BTCUSDT');
 
-  // Active Positions & History
-  const [positions, setPositions] = useState<TradeSignal[]>(() => {
-    const saved = localStorage.getItem('turboscalp_positions');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    const btcAsset = INITIAL_BINANCE_ASSETS[0];
-    const initialTrade = createTradeSignal(
-      btcAsset,
-      'BUY (LONG)',
-      {
-        enabled: true,
-        scanIntervalSec: 2,
-        minConfidenceScore: 85,
-        allowedDirections: 'BOTH',
-        maxOpenTrades: 6,
-        tradeSizeUsd: 500,
-        leverage: 10,
-        tp1Percent: 0.8,
-        tp2Percent: 1.8,
-        tp3Percent: 3.0,
-        slPercent: 0.6,
-        autoMoveBreakevenAtTp1: true,
-        selectedPairs: ['BTC/USDT'],
-      },
-      'AUTO_PILOT'
-    );
-    return [initialTrade];
-  });
-  const positionsRef = useRef(positions);
-  positionsRef.current = positions;
+  // ====================================================
+  // BINANCE API STATES
+  // ====================================================
 
-  const [closedTrades, setClosedTrades] = useState<ClosedSignal[]>(() => {
-    const saved = localStorage.getItem('turboscalp_closed');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    return [];
-  });
+  const [isBinanceConnected, setIsBinanceConnected] =
+    useState(false);
 
-  // Binance API settings
-  const [apiSettings, setApiSettings] = useState<BinanceApiSettings>(() => {
-    const saved = localStorage.getItem('turboscalp_api');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    return {
-      apiKey: '',
-      apiSecret: '',
-      isConfigured: false,
-      network: 'DEMO_PAPER',
-      tradingType: 'SPOT',
-      usdtBalance: 0,
-      demoBalance: 10000.0,
-    };
-  });
+  const [serverConfig, setServerConfig] =
+    useState<BinanceConfig | null>(null);
 
-  // Alerts
-  const [alerts, setAlerts] = useState<TradeAlert[]>([
-    {
-      id: 'ALT-INIT-1',
-      type: 'INFO',
-      title: 'TurboScalp Engine Initialized',
-      message: 'Binance Live WebSocket connected via AWS Proxy. Auto-Pilot Scanner standing by.',
-      symbol: 'SYSTEM',
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      timeMs: Date.now(),
-      read: false,
-      level: 'info',
+  const [showSettings, setShowSettings] =
+    useState(false);
+
+  const [tradingMode, setTradingMode] =
+    useState<TradingMode>('PAPER');
+
+  // ====================================================
+  // ACCOUNT BALANCE STATES
+  // ====================================================
+
+  const [account, setAccount] =
+    useState<AccountData>(EMPTY_ACCOUNT);
+
+  const [positions, setPositions] =
+    useState<Position[]>([]);
+
+  const [openOrders, setOpenOrders] =
+    useState<any[]>([]);
+
+  const [accountLoading, setAccountLoading] =
+    useState(false);
+
+  const [accountError, setAccountError] =
+    useState('');
+
+  // ====================================================
+  // SCANNER STATES
+  // ====================================================
+
+  const [scannerRunning, setScannerRunning] =
+    useState(true);
+
+  const [scannerLoading, setScannerLoading] =
+    useState(false);
+
+  const [scanError, setScanError] =
+    useState('');
+
+  const scannerBusyRef = useRef(false);
+
+  // ====================================================
+  // ORDER STATES
+  // ====================================================
+
+  const [orderSide, setOrderSide] =
+    useState<'BUY' | 'SELL'>('BUY');
+
+  const [quantityUsd, setQuantityUsd] =
+    useState('25');
+
+  const [leverage, setLeverage] =
+    useState('2');
+
+  const [orderLoading, setOrderLoading] =
+    useState(false);
+
+  const [orderMessage, setOrderMessage] =
+    useState('');
+
+  const [paperOrders, setPaperOrders] =
+    useState<PaperOrder[]>([]);
+
+  // ====================================================
+  // ACTIVITY LOG
+  // ====================================================
+
+  const [alerts, setAlerts] =
+    useState<string[]>([
+      'TurboScalp started. Waiting for Binance market data.'
+    ]);
+
+  // ====================================================
+  // ACTIVITY LOGGER
+  // ====================================================
+
+  const pushAlert = useCallback(
+    (message: string) => {
+
+      const timestamp =
+        new Date().toLocaleTimeString();
+
+      setAlerts(previous => [
+
+        `[${timestamp}] ${message}`,
+
+        ...previous
+
+      ].slice(0, 40));
+
     },
-  ]);
+    []
+  );
 
-  const [customRules, setCustomRules] = useState<CustomAlertRule[]>([]);
+  // ====================================================
+  // APPLY ACCOUNT DATA
+  // ====================================================
 
-  // Modals state
-  const [isPushModalOpen, setIsPushModalOpen] = useState(false);
-  const [isApiModalOpen, setIsApiModalOpen] = useState(false);
-  const [isRiskModalOpen, setIsRiskModalOpen] = useState(false);
+  const applyAccountData = useCallback(
+    (data: any) => {
 
-  // Scanning indicator
-  const [isScanning, setIsScanning] = useState(false);
+      setAccount({
 
-  // Save changes to localStorage
-  useEffect(() => {
-    localStorage.setItem('turboscalp_config', JSON.stringify(config));
-  }, [config]);
+        availableBalance: String(
+          data.availableBalance ?? '0'
+        ),
 
-  useEffect(() => {
-    localStorage.setItem('turboscalp_positions', JSON.stringify(positions));
-  }, [positions]);
+        totalWalletBalance: String(
+          data.totalWalletBalance ?? '0'
+        ),
 
-  useEffect(() => {
-    localStorage.setItem('turboscalp_closed', JSON.stringify(closedTrades));
-  }, [closedTrades]);
+        totalUnrealizedProfit: String(
+          data.totalUnrealizedProfit ?? '0'
+        ),
 
-  useEffect(() => {
-    localStorage.setItem('turboscalp_api', JSON.stringify(apiSettings));
-  }, [apiSettings]);
+        canTrade: Boolean(data.canTrade)
 
-  // Push notification helper & Telegram trigger
-  const addAlert = useCallback((alert: Omit<TradeAlert, 'id' | 'timestamp' | 'timeMs' | 'read'>) => {
-    const newAlert: TradeAlert = {
-      ...alert,
-      id: `ALT-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-      timeMs: Date.now(),
-      read: false,
-    };
-    setAlerts((prev) => [newAlert, ...prev.slice(0, 49)]);
+      });
 
-    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
-      try {
-        new Notification(alert.title, { body: alert.message });
-      } catch (e) {
-        console.debug('Notification err:', e);
-      }
-    }
-  }, []);
+    },
+    []
+  );
 
-  useEffect(() => {
-    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission().catch(() => {});
-    }
-  }, []);
+  // ====================================================
+  // LOAD SERVER CONFIGURATION AND ACCOUNT
+  // ====================================================
 
-  const handleToggleAudio = () => {
-    const next = !isMuted;
-    setIsMuted(next);
-    setAudioMuted(next);
-  };
-
-  // =========================================================================
-  // REAL-TIME WEBSOCKET STREAM VIA PROXY
-  // =========================================================================
-  useEffect(() => {
-    let ws: WebSocket | null = null;
-    let pingInterval: NodeJS.Timeout | null = null;
-    let reconnectTimeout: NodeJS.Timeout | null = null;
-    let isMounted = true;
-
-    const connectWebSocket = () => {
-      try {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}`;
-        ws = new WebSocket(wsUrl);
-
-        ws.onopen = () => {
-          if (!isMounted) return;
-          setConnectionStatus('LIVE');
-          setLatencyMs(Math.floor(Math.random() * 15 + 15));
-        };
-
-        ws.onmessage = (event) => {
-          if (!isMounted) return;
-          try {
-            const parsed = JSON.parse(event.data);
-            if (!parsed.data) return;
-
-            const { s, c, h, l, v } = parsed.data;
-            if (!s || !c) return;
-
-            const tickerSymbol = s;
-            const priceVal = parseFloat(c);
-            const highVal = parseFloat(h);
-            const lowVal = parseFloat(l);
-
-            setAssets((prev) => {
-              let changed = false;
-              const next = prev.map((asset) => {
-                const rawSymbol = asset.symbol.replace('/', '').toUpperCase();
-                if (rawSymbol !== tickerSymbol) return asset;
-
-                const prevPrice = asset.price;
-                if (prevPrice !== priceVal) changed = true;
-
-                const rsiShift = priceVal >= prevPrice ? 0.1 : -0.1;
-                const newRsi = Math.max(15, Math.min(88, Number(((asset.rsi ?? 50) + rsiShift).toFixed(1))));
-
-                return {
-                  ...asset,
-                  price: priceVal,
-                  high24h: highVal,
-                  low24h: lowVal,
-                  rsi: newRsi,
-                };
-              });
-              return changed ? next : prev;
-            });
-
-            // Update Active Positions
-            setPositions((currentPositions) => {
-              if (currentPositions.length === 0) return currentPositions;
-
-              let hasUpdates = false;
-              const remainingPositions: TradeSignal[] = [];
-              const newlyClosed: ClosedSignal[] = [];
-
-              for (const pos of currentPositions) {
-                const rawSymbol = pos.symbol.replace('/', '').toUpperCase();
-                if (rawSymbol !== tickerSymbol) {
-                  remainingPositions.push(pos);
-                  continue;
-                }
-
-                const { updatedSignal, triggeredEvent } = updateActivePosition(
-                  pos,
-                  priceVal,
-                  configRef.current.autoMoveBreakevenAtTp1
-                );
-
-                if (triggeredEvent === 'TP1' && pos.status === 'ACTIVE') {
-                  addAlert({
-                    type: 'TP_HIT',
-                    title: `Take Profit 1 Reached: ${pos.symbol}`,
-                    message: `Target hit at $${priceVal}. Stop loss moved to Breakeven $${pos.entryPrice}!`,
-                    symbol: pos.symbol,
-                    level: 'success',
-                  });
-                  playTakeProfitSound();
-                  remainingPositions.push(updatedSignal);
-                  hasUpdates = true;
-                } else if (triggeredEvent === 'TP2' || triggeredEvent === 'TP3') {
-                  addAlert({
-                    type: 'TP_HIT',
-                    title: `Take Profit Hit: ${pos.symbol}`,
-                    message: `Full target closed at $${priceVal} with +${updatedSignal.pnlPercentage.toFixed(2)}% profit!`,
-                    symbol: pos.symbol,
-                    level: 'success',
-                  });
-                  playTakeProfitSound();
-                  newlyClosed.push({
-                    id: pos.id,
-                    symbol: pos.symbol,
-                    direction: pos.direction,
-                    timeframe: pos.timeframe,
-                    entryPrice: pos.entryPrice,
-                    exitPrice: priceVal,
-                    pnlPercentage: updatedSignal.pnlPercentage,
-                    pnlUsd: updatedSignal.pnlUsd || 0,
-                    outcome: triggeredEvent === 'TP2' ? 'TP2' : 'TP3',
-                    closedAt: new Date().toLocaleTimeString(),
-                    holdingTime: `${Math.max(1, Math.floor((Date.now() - pos.startTime) / 60000))}m`,
-                    executionMode: pos.executionMode,
-                    leverage: pos.leverage || 10,
-                  });
-                  hasUpdates = true;
-                } else if (triggeredEvent === 'SL') {
-                  addAlert({
-                    type: 'SL_HIT',
-                    title: `Stop Loss Triggered: ${pos.symbol}`,
-                    message: `Position closed at $${priceVal} (${updatedSignal.pnlPercentage.toFixed(2)}%).`,
-                    symbol: pos.symbol,
-                    level: 'danger',
-                  });
-                  playStopLossSound();
-                  newlyClosed.push({
-                    id: pos.id,
-                    symbol: pos.symbol,
-                    direction: pos.direction,
-                    timeframe: pos.timeframe,
-                    entryPrice: pos.entryPrice,
-                    exitPrice: priceVal,
-                    pnlPercentage: updatedSignal.pnlPercentage,
-                    pnlUsd: updatedSignal.pnlUsd || 0,
-                    outcome: 'SL',
-                    closedAt: new Date().toLocaleTimeString(),
-                    holdingTime: `${Math.max(1, Math.floor((Date.now() - pos.startTime) / 60000))}m`,
-                    executionMode: pos.executionMode,
-                    leverage: pos.leverage || 10,
-                  });
-                  hasUpdates = true;
-                } else {
-                  if (pos.currentPrice !== priceVal || pos.pnlPercentage !== updatedSignal.pnlPercentage) {
-                    hasUpdates = true;
-                  }
-                  remainingPositions.push(updatedSignal);
-                }
-              }
-
-              if (newlyClosed.length > 0) {
-                setClosedTrades((prev) => [...newlyClosed, ...prev]);
-                const netClosedPnlUsd = newlyClosed.reduce((acc, t) => acc + t.pnlUsd, 0);
-                setApiSettings((prev) => ({
-                  ...prev,
-                  demoBalance: Number(((prev.demoBalance || 10000) + netClosedPnlUsd).toFixed(2)),
-                }));
-              }
-
-              return hasUpdates ? remainingPositions : currentPositions;
-            });
-          } catch (e) {
-            console.debug('WS parse err:', e);
-          }
-        };
-
-        ws.onerror = () => {
-          if (!isMounted) return;
-          setConnectionStatus('RECONNECTING');
-        };
-
-        ws.onclose = () => {
-          if (!isMounted) return;
-          setConnectionStatus('RECONNECTING');
-          reconnectTimeout = setTimeout(connectWebSocket, 3000);
-        };
-      } catch (err) {
-        console.debug('WS connection init err:', err);
-        setConnectionStatus('RECONNECTING');
-        reconnectTimeout = setTimeout(connectWebSocket, 3000);
-      }
-    };
-
-    connectWebSocket();
-
-    pingInterval = setInterval(() => {
-      setLatencyMs(Math.floor(Math.random() * 12 + 18));
-    }, 4000);
-
-    return () => {
-      isMounted = false;
-      if (ws) ws.close();
-      if (pingInterval) clearInterval(pingInterval);
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-    };
-  }, [addAlert]);
-
-  // =========================================================================
-  // AUTO-PILOT SCANNER ENGINE
-  // =========================================================================
-  const executeScan = useCallback(async () => {
-    const currentAssets = assetsRef.current;
-    const currentConfig = configRef.current;
-    if (currentAssets.length === 0 || isScanning) return;
-
-    setIsScanning(true);
+  const loadServerConfig = useCallback(async () => {
 
     try {
-      const activeTrades = positionsRef.current;
-      const availableSlots = currentConfig.maxOpenTrades - activeTrades.length;
 
-      if (availableSlots <= 0) {
-        setIsScanning(false);
-        return;
-      }
+      const config = await getBinanceConfig();
 
-      const activeKeys = new Set(activeTrades.map((t) => `${t.symbol}_${t.direction}`));
+      setServerConfig(config);
 
-      const eligibleAssets = currentAssets
-        .filter((a) => currentConfig.selectedPairs.includes(a.symbol))
-        .sort((a, b) => (a.symbol === 'BTC/USDT' ? -1 : b.symbol === 'BTC/USDT' ? 1 : 0));
+      const connected = Boolean(
+        config.credentialsConfigured
+      );
 
-      const newTradesToOpen: TradeSignal[] = [];
+      setIsBinanceConnected(connected);
 
-      for (const asset of eligibleAssets) {
-        if (newTradesToOpen.length >= availableSlots) break;
+      setTradingMode(
+        connected
+          ? 'BINANCE_DEMO'
+          : 'PAPER'
+      );
 
-        const evalResult = evaluateMarketAsset(asset);
+      if (connected) {
 
-        if (
-          currentConfig.allowedDirections === 'LONG_ONLY' &&
-          evalResult.direction !== 'BUY (LONG)'
-        ) {
-          continue;
-        }
-        if (
-          currentConfig.allowedDirections === 'SHORT_ONLY' &&
-          evalResult.direction !== 'SELL (SHORT)'
-        ) {
-          continue;
-        }
+        try {
 
-        if (evalResult.confidenceScore < currentConfig.minConfidenceScore) {
-          continue;
-        }
+          // Restore real account balances after page reload.
 
-        const tradeKey = `${asset.symbol}_${evalResult.direction}`;
-        if (activeKeys.has(tradeKey)) continue;
+          const accountData =
+            await getBinanceAccount();
 
-        const pushResult = await executeBinancePushOrder({
-          symbol: asset.symbol,
-          side: evalResult.direction === 'BUY (LONG)' ? 'BUY' : 'SELL',
-          type: 'MARKET',
-          price: asset.price,
-          quantityUsd: currentConfig.tradeSizeUsd,
-          leverage: currentConfig.leverage,
-          apiSettings,
-        });
+          applyAccountData(accountData);
 
-        if (pushResult.success) {
-          const newSignal = createTradeSignal(
-            asset,
-            evalResult.direction,
-            currentConfig,
-            'AUTO_PILOT'
+        } catch (error) {
+
+          console.error(
+            'Connected account balance retrieval failed:',
+            error
           );
 
-          newTradesToOpen.push(newSignal);
-          activeKeys.add(tradeKey);
+          setAccountError(
+            error instanceof Error
+              ? error.message
+              : 'Unable to load account balance.'
+          );
 
-          playSignalAlert(evalResult.direction === 'BUY (LONG)');
-          addAlert({
-            type: 'PUSH_EXECUTED',
-            title: `Auto-Pilot: ${newSignal.direction} on ${asset.symbol}`,
-            message: `${pushResult.message}. Confluence: ${evalResult.confidenceScore}%. Target: $${newSignal.takeProfit1}`,
-            symbol: asset.symbol,
-            level: 'success',
-          });
-
-          // Trigger Telegram comparison alert
-          try {
-            await fetch('/api/signals/compare', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                symbol: asset.symbol,
-                strategy: '15M Confluence Matrix Auto-Pilot',
-                price: asset.price,
-                indicatorValue: evalResult.confidenceScore,
-                threshold: currentConfig.minConfidenceScore,
-              }),
-            });
-          } catch (e) {
-            console.debug('Telegram alert dispatch err:', e);
-          }
         }
+
+      } else {
+
+        setAccount(EMPTY_ACCOUNT);
+
+        setPositions([]);
+
+        setOpenOrders([]);
+
       }
 
-      if (newTradesToOpen.length > 0) {
-        setPositions((prev) => [...prev, ...newTradesToOpen]);
-      }
-    } catch (err) {
-      console.error('Scan execution error:', err);
-    } finally {
-      setIsScanning(false);
+    } catch (error) {
+
+      console.error(
+        'Server configuration request failed:',
+        error
+      );
+
+      setServerConfig(null);
+
     }
-  }, [apiSettings, addAlert, isScanning]);
+
+  }, [applyAccountData]);
+
+  // ====================================================
+  // RESTORE CONNECTION AFTER APP START
+  // ====================================================
 
   useEffect(() => {
-    if (!config.enabled) return;
 
-    const intervalMs = Math.max(1000, config.scanIntervalSec * 1000);
-    const interval = setInterval(() => {
-      executeScan();
-    }, intervalMs);
+    void loadServerConfig();
 
-    return () => clearInterval(interval);
-  }, [config.enabled, config.scanIntervalSec, executeScan]);
+  }, [loadServerConfig]);
 
-  // Position Controls
-  const handleManualPushTrade = async (params: {
-    symbol: string;
-    direction: 'BUY (LONG)' | 'SELL (SHORT)';
-    entryPrice: number;
-    stopLoss: number;
-    takeProfit1: number;
-    takeProfit2: number;
-    leverage: number;
-    sizeUsd: number;
-  }) => {
-    const asset = assets.find((a) => a.symbol === params.symbol) || assets[0];
-    const pushRes = await executeBinancePushOrder({
-      symbol: params.symbol,
-      side: params.direction === 'BUY (LONG)' ? 'BUY' : 'SELL',
-      type: 'MARKET',
-      price: params.entryPrice,
-      quantityUsd: params.sizeUsd,
-      leverage: params.leverage,
-      apiSettings,
-    });
+  // ====================================================
+  // BINANCE MARKET WEBSOCKET
+  // ====================================================
 
-    if (pushRes.success) {
-      playPushTradeExecuted();
-      const evalRes = evaluateMarketAsset(asset);
-      const newSignal: TradeSignal = {
-        id: `MANUAL-${params.symbol.replace(/[^A-Z0-9]/g, '')}-${Date.now().toString(36).toUpperCase()}`,
-        symbol: params.symbol,
-        name: asset.name,
-        assetClass: 'Crypto',
-        direction: params.direction,
-        status: 'ACTIVE',
-        timeframe: '5m',
-        entryPrice: pushRes.executedPrice || params.entryPrice,
-        currentPrice: pushRes.executedPrice || params.entryPrice,
-        stopLoss: params.stopLoss,
-        takeProfit1: params.takeProfit1,
-        takeProfit2: params.takeProfit2,
-        targetPrice: params.takeProfit1,
-        riskRewardRatio: Number(((params.takeProfit1 - params.entryPrice) / (params.entryPrice - params.stopLoss)).toFixed(2)),
-        confidenceScore: evalRes.confidenceScore,
-        pnlPercentage: 0.0,
-        pnlUsd: 0.0,
-        confluences: evalRes.confluences,
-        reasoning: `Manual Push Order executed directly to Binance.`,
-        startTime: Date.now(),
-        executionMode: 'MANUAL_PUSH',
-        leverage: params.leverage,
-        positionSizeUsd: params.sizeUsd,
-        breakevenApplied: false,
-      };
+  useEffect(() => {
 
-      setPositions((prev) => [newSignal, ...prev]);
-      addAlert({
-        type: 'PUSH_EXECUTED',
-        title: `Manual Order Filled: ${params.direction} ${params.symbol}`,
-        message: `Executed @ $${pushRes.executedPrice}. Leverage: ${params.leverage}x, Size: $${params.sizeUsd} USDT.`,
-        symbol: params.symbol,
-        level: 'success',
-      });
+    let socket: WebSocket | null = null;
+
+    let reconnectTimer:
+      ReturnType<typeof setTimeout> | null = null;
+
+    let reconnectDelay = 1000;
+
+    let stopped = false;
+
+    function connect() {
+
+      if (stopped) return;
+
+      const protocol =
+        window.location.protocol === 'https:'
+          ? 'wss:'
+          : 'ws:';
+
+      // Dedicated market endpoint.
+      // Vite HMR does not use this connection.
+
+      const socketUrl =
+        `${protocol}//${window.location.host}/ws/market`;
+
+      try {
+
+        socket = new WebSocket(socketUrl);
+
+        socket.onopen = () => {
+
+          // Socket connection alone is not market data.
+
+          setConnectionStatus('RECONNECTING');
+
+        };
+
+        socket.onmessage = event => {
+
+          try {
+
+            const message = JSON.parse(event.data);
+
+            // ------------------------------------------
+            // UPSTREAM CONNECTION STATUS
+            // ------------------------------------------
+
+            if (message.type === 'connection') {
+
+              if (message.upstream === 'LIVE') {
+
+                setConnectionStatus('LIVE');
+
+              } else if (
+                message.upstream === 'OFFLINE'
+              ) {
+
+                setConnectionStatus('OFFLINE');
+
+              } else {
+
+                setConnectionStatus('RECONNECTING');
+
+              }
+
+              return;
+
+            }
+
+            // ------------------------------------------
+            // BINANCE TICKER DATA
+            // ------------------------------------------
+
+            const ticker =
+              message.data || message;
+
+            if (
+              !ticker.s ||
+              ticker.c === undefined
+            ) {
+              return;
+            }
+
+            const symbol =
+              String(ticker.s).toUpperCase();
+
+            const price = Number(ticker.c);
+
+            if (
+              !Number.isFinite(price) ||
+              price <= 0
+            ) {
+              return;
+            }
+
+            // Reset reconnect backoff after valid data.
+
+            reconnectDelay = 1000;
+
+            setAssets(previous =>
+              previous.map(asset => {
+
+                if (asset.symbol !== symbol) {
+                  return asset;
+                }
+
+                return {
+
+                  ...asset,
+
+                  price,
+
+                  high24h:
+                    Number(ticker.h) ||
+                    asset.high24h,
+
+                  low24h:
+                    Number(ticker.l) ||
+                    asset.low24h,
+
+                  change24h:
+                    ticker.P !== undefined
+                      ? Number(ticker.P)
+                      : asset.change24h,
+
+                  volume24h:
+                    ticker.q !== undefined
+                      ? Number(ticker.q)
+                      : asset.volume24h,
+
+                  updatedAt: Date.now()
+
+                };
+
+              })
+            );
+
+          } catch (error) {
+
+            console.error(
+              'Market data parsing error:',
+              error
+            );
+
+          }
+
+        };
+
+        socket.onerror = () => {
+
+          setConnectionStatus('RECONNECTING');
+
+          socket?.close();
+
+        };
+
+        socket.onclose = () => {
+
+          if (stopped) return;
+
+          setConnectionStatus('RECONNECTING');
+
+          const delay = reconnectDelay;
+
+          reconnectDelay = Math.min(
+            reconnectDelay * 2,
+            15000
+          );
+
+          reconnectTimer = setTimeout(
+            connect,
+            delay
+          );
+
+        };
+
+      } catch (error) {
+
+        console.error(
+          'Market WebSocket error:',
+          error
+        );
+
+        setConnectionStatus('OFFLINE');
+
+        const delay = reconnectDelay;
+
+        reconnectDelay = Math.min(
+          reconnectDelay * 2,
+          15000
+        );
+
+        reconnectTimer = setTimeout(
+          connect,
+          delay
+        );
+
+      }
+
     }
-  };
 
-  const handleClosePosition = (id: string) => {
-    const pos = positions.find((p) => p.id === id);
-    if (!pos) return;
+    connect();
 
-    playPushTradeExecuted();
-    const closed: ClosedSignal = {
-      id: pos.id,
-      symbol: pos.symbol,
-      direction: pos.direction,
-      timeframe: pos.timeframe,
-      entryPrice: pos.entryPrice,
-      exitPrice: pos.currentPrice,
-      pnlPercentage: pos.pnlPercentage,
-      pnlUsd: pos.pnlUsd || 0,
-      outcome: 'MANUAL',
-      closedAt: new Date().toLocaleTimeString(),
-      holdingTime: `${Math.max(1, Math.floor((Date.now() - pos.startTime) / 60000))}m`,
-      executionMode: pos.executionMode,
-      leverage: pos.leverage || 10,
+    return () => {
+
+      stopped = true;
+
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+
+      socket?.close();
+
     };
 
-    setClosedTrades((prev) => [closed, ...prev]);
-    setPositions((prev) => prev.filter((p) => p.id !== id));
+  }, []);
 
-    if (apiSettings.network === 'DEMO_PAPER') {
-      setApiSettings((prev) => ({
-        ...prev,
-        demoBalance: Number(((prev.demoBalance || 10000) + (pos.pnlUsd || 0)).toFixed(2)),
-      }));
+  // ====================================================
+  // TECHNICAL SCANNER
+  // ====================================================
+
+  const runTechnicalScanner = useCallback(async () => {
+
+    if (!scannerRunning) return;
+
+    // Do not allow overlapping scans.
+
+    if (scannerBusyRef.current) return;
+
+    scannerBusyRef.current = true;
+
+    setScannerLoading(true);
+
+    setScanError('');
+
+    try {
+
+      const symbols = [
+        'BTCUSDT',
+        'ETHUSDT',
+        'SOLUSDT',
+        'BNBUSDT',
+        'XRPUSDT',
+        'DOGEUSDT'
+      ];
+
+      // ----------------------------------------------
+      // FETCH CANDLES
+      // ----------------------------------------------
+
+      const results = await Promise.all(
+        symbols.map(async symbol => {
+
+          try {
+
+            const candles = await fetchBinanceKlines(
+              symbol,
+              '15m',
+              100
+            );
+
+            const closes = candles.map(
+              candle => Number(candle[4])
+            );
+
+            if (closes.length < 25) {
+              return null;
+            }
+
+            const rsi = calculateRSI(closes);
+
+            const ema9 = calculateEMA(closes, 9);
+
+            const ema21 = calculateEMA(closes, 21);
+
+            if (
+              rsi === null ||
+              ema9 === null ||
+              ema21 === null
+            ) {
+              return null;
+            }
+
+            return {
+
+              symbol,
+
+              rsi,
+
+              ema9,
+
+              ema21
+
+            };
+
+          } catch (error) {
+
+            console.warn(
+              `Scanner error ${symbol}:`,
+              error
+            );
+
+            return null;
+
+          }
+
+        })
+      );
+
+      const validResults = results.filter(
+        (
+          item
+        ): item is NonNullable<typeof item> =>
+          item !== null
+      );
+
+      if (validResults.length === 0) {
+
+        setScanError(
+          'No candle data returned. Check Binance market connectivity.'
+        );
+
+        return;
+
+      }
+
+      const resultMap = new Map(
+        validResults.map(result => [
+          result.symbol,
+          result
+        ])
+      );
+
+      // ----------------------------------------------
+      // UPDATE USING LATEST ASSET STATE
+      // ----------------------------------------------
+
+      setAssets(previous =>
+        previous.map(asset => {
+
+          const result = resultMap.get(
+            asset.symbol
+          );
+
+          if (!result) return asset;
+
+          const signal = calculateSignal(
+            result.ema9,
+            result.ema21,
+            result.rsi,
+            asset.change24h
+          );
+
+          return {
+
+            ...asset,
+
+            rsi: result.rsi,
+
+            ema9: result.ema9,
+
+            ema21: result.ema21,
+
+            signal
+
+          };
+
+        })
+      );
+
+    } catch (error: any) {
+
+      setScanError(
+        error?.message ||
+        'Technical scanner failed.'
+      );
+
+    } finally {
+
+      scannerBusyRef.current = false;
+
+      setScannerLoading(false);
+
     }
 
-    addAlert({
-      type: 'INFO',
-      title: `Trade Closed: ${pos.symbol}`,
-      message: `Manually closed at $${pos.currentPrice} with PnL ${pos.pnlPercentage >= 0 ? '+' : ''}${pos.pnlPercentage.toFixed(2)}%`,
-      symbol: pos.symbol,
-      level: pos.pnlPercentage >= 0 ? 'success' : 'danger',
-    });
-  };
+  // No assets dependency.
+  // Latest price changes are read inside setAssets.
 
-  const handleMoveBreakeven = (id: string) => {
-    setPositions((prev) =>
-      prev.map((p) => {
-        if (p.id === id) {
-          playPushTradeExecuted();
-          return {
-            ...p,
-            stopLoss: p.entryPrice,
-            breakevenApplied: true,
-          };
-        }
-        return p;
-      })
+  }, [scannerRunning]);
+
+  // ====================================================
+  // AUTOMATIC SCANNER TIMER
+  // ====================================================
+
+  useEffect(() => {
+
+    if (!scannerRunning) return;
+
+    void runTechnicalScanner();
+
+    const timer = setInterval(() => {
+
+      void runTechnicalScanner();
+
+    }, 60000);
+
+    return () => {
+
+      clearInterval(timer);
+
+    };
+
+  }, [scannerRunning, runTechnicalScanner]);
+
+  // ====================================================
+  // FILTER MARKETS
+  // ====================================================
+
+  const filteredAssets = useMemo(() => {
+
+    const query = search.toLowerCase();
+
+    return assets.filter(asset =>
+
+      asset.symbol.toLowerCase().includes(query) ||
+
+      asset.name.toLowerCase().includes(query)
+
     );
-  };
 
-  const handlePartialTakeProfit = (id: string) => {
-    setPositions((prev) =>
-      prev.map((p) => {
-        if (p.id === id) {
-          playTakeProfitSound();
-          const halfSize = Math.round((p.positionSizeUsd || 500) / 2);
-          const realizedUsd = (p.pnlUsd || 0) / 2;
-          const closedPartial: ClosedSignal = {
-            id: `${p.id}-50PCT`,
-            symbol: p.symbol,
-            direction: p.direction,
-            timeframe: p.timeframe,
-            entryPrice: p.entryPrice,
-            exitPrice: p.currentPrice,
-            pnlPercentage: p.pnlPercentage,
-            pnlUsd: realizedUsd,
-            outcome: 'TP1',
-            closedAt: new Date().toLocaleTimeString(),
-            holdingTime: `${Math.max(1, Math.floor((Date.now() - p.startTime) / 60000))}m`,
-            executionMode: p.executionMode,
-            leverage: p.leverage || 10,
-          };
-          setClosedTrades((closed) => [closedPartial, ...closed]);
-          return {
-            ...p,
-            positionSizeUsd: halfSize,
-            pnlUsd: (p.pnlUsd || 0) / 2,
-          };
-        }
-        return p;
-      })
-    );
-  };
+  }, [assets, search]);
 
-  const handleCloseAllTrades = () => {
-    if (positions.length === 0) return;
-    playPushTradeExecuted();
-    const now = new Date().toLocaleTimeString();
-    const closedList: ClosedSignal[] = positions.map((pos) => ({
-      id: pos.id,
-      symbol: pos.symbol,
-      direction: pos.direction,
-      timeframe: pos.timeframe,
-      entryPrice: pos.entryPrice,
-      exitPrice: pos.currentPrice,
-      pnlPercentage: pos.pnlPercentage,
-      pnlUsd: pos.pnlUsd || 0,
-      outcome: 'MANUAL',
-      closedAt: now,
-      holdingTime: `${Math.max(1, Math.floor((Date.now() - pos.startTime) / 60000))}m`,
-      executionMode: pos.executionMode,
-      leverage: pos.leverage || 10,
-    }));
+  const selectedAsset = useMemo(
 
-    const totalPnl = positions.reduce((acc, p) => acc + (p.pnlUsd || 0), 0);
-    setClosedTrades((prev) => [...closedList, ...prev]);
-    setPositions([]);
+    () => assets.find(
+      item => item.symbol === selectedSymbol
+    ),
 
-    if (apiSettings.network === 'DEMO_PAPER') {
-      setApiSettings((prev) => ({
-        ...prev,
-        demoBalance: Number(((prev.demoBalance || 10000) + totalPnl).toFixed(2)),
-      }));
+    [assets, selectedSymbol]
+
+  );
+
+  const buySignals = assets.filter(
+    asset => asset.signal === 'BUY'
+  ).length;
+
+  const sellSignals = assets.filter(
+    asset => asset.signal === 'SELL'
+  ).length;
+
+  const liveMarketCount = assets.filter(
+    asset => asset.price > 0
+  ).length;
+
+  // ====================================================
+  // BINANCE CONNECTION CHANGE
+  // ====================================================
+
+  const handleConnectionChange = useCallback(
+    (state: BinanceConnectionState) => {
+
+      setIsBinanceConnected(state.connected);
+
+      setTradingMode(
+        state.connected
+          ? 'BINANCE_DEMO'
+          : 'PAPER'
+      );
+
+      if (state.connected) {
+
+        setAccount(previous => ({
+
+          ...previous,
+
+          walletBalance: undefined
+
+        } as any));
+
+        applyAccountData({
+
+          totalWalletBalance:
+            state.walletBalance ??
+            '0',
+
+          availableBalance:
+            state.availableBalance ??
+            '0',
+
+          totalUnrealizedProfit:
+            account.totalUnrealizedProfit,
+
+          canTrade: Boolean(state.canTrade)
+
+        });
+
+        pushAlert(
+          'Binance API KEY ACTIVE. Futures Demo authentication successful.'
+        );
+
+      } else {
+
+        setAccount(EMPTY_ACCOUNT);
+
+        setPositions([]);
+
+        setOpenOrders([]);
+
+        pushAlert(
+          'Binance API disconnected. Paper mode selected.'
+        );
+
+      }
+
+      // Re-read authoritative server session status.
+
+      void loadServerConfig();
+
+    },
+    [
+      account.totalUnrealizedProfit,
+      applyAccountData,
+      loadServerConfig,
+      pushAlert
+    ]
+  );
+
+  // ====================================================
+  // REFRESH ACCOUNT DATA
+  // ====================================================
+
+  const refreshAccount = async () => {
+
+    if (!isBinanceConnected) {
+
+      setAccountError(
+        'Connect your Binance Futures Demo API first.'
+      );
+
+      return;
+
     }
 
-    addAlert({
-      type: 'INFO',
-      title: 'Emergency Close All Executed',
-      message: `Closed all active trades with total PnL ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}.`,
-      symbol: 'PANIC_CLOSE',
-      level: 'warning',
-    });
+    setAccountLoading(true);
+
+    setAccountError('');
+
+    try {
+
+      const [
+        accountData,
+        positionData,
+        orderData
+      ] = await Promise.all([
+
+        getBinanceAccount(),
+
+        getBinancePositions(),
+
+        getBinanceOpenOrders()
+
+      ]);
+
+      applyAccountData(accountData);
+
+      setPositions(
+        positionData.positions || []
+      );
+
+      setOpenOrders(
+        orderData.orders || []
+      );
+
+      pushAlert(
+        'Binance Demo account balances and positions refreshed.'
+      );
+
+    } catch (error: any) {
+
+      setAccountError(
+        error?.message ||
+        'Account refresh failed.'
+      );
+
+      pushAlert(
+        'Binance account refresh failed.'
+      );
+
+    } finally {
+
+      setAccountLoading(false);
+
+    }
+
   };
 
-  const performanceStats = useMemo(() => calculatePerformanceStats(closedTrades), [closedTrades]);
-  const totalUnrealizedPnlUsd = useMemo(() => positions.reduce((acc, p) => acc + (p.pnlUsd || 0), 0), [positions]);
-  const unreadAlertsCount = useMemo(() => alerts.filter((a) => !a.read).length, [alerts]);
+  // ====================================================
+  // VALIDATE ORDER
+  // ====================================================
+
+  const validateOrder = async () => {
+
+    const amount = Number(quantityUsd);
+
+    const selectedLeverage = Number(leverage);
+
+    const maxOrder =
+      serverConfig?.maxOrderUsd ?? 1000;
+
+    const maxLeverage =
+      serverConfig?.maxLeverage ?? 10;
+
+    if (
+      !Number.isFinite(amount) ||
+      amount <= 0 ||
+      amount > maxOrder
+    ) {
+
+      setOrderMessage(
+        `Order amount must be between $0 and $${maxOrder}.`
+      );
+
+      return;
+
+    }
+
+    if (
+      !Number.isInteger(selectedLeverage) ||
+      selectedLeverage < 1 ||
+      selectedLeverage > maxLeverage
+    ) {
+
+      setOrderMessage(
+        `Leverage must be between 1 and ${maxLeverage}x.`
+      );
+
+      return;
+
+    }
+
+    setOrderLoading(true);
+
+    setOrderMessage('');
+
+    try {
+
+      if (tradingMode === 'PAPER') {
+
+        setOrderMessage(
+          'Paper order validation successful. No Binance order was sent.'
+        );
+
+        return;
+
+      }
+
+      if (!isBinanceConnected) {
+
+        throw new Error(
+          'Binance API is not connected.'
+        );
+
+      }
+
+      const result = await validateBinanceOrder({
+
+        symbol: selectedSymbol,
+
+        side: orderSide,
+
+        quantityUsd: amount,
+
+        leverage: selectedLeverage
+
+      });
+
+      setOrderMessage(
+        result.message ||
+        'Binance Demo test order accepted. No order was executed.'
+      );
+
+    } catch (error: any) {
+
+      setOrderMessage(
+        error?.message ||
+        'Order validation failed.'
+      );
+
+    } finally {
+
+      setOrderLoading(false);
+
+    }
+
+  };
+
+  // ====================================================
+  // PLACE PAPER OR DEMO ORDER
+  // ====================================================
+
+  const placeOrder = async () => {
+
+    const amount = Number(quantityUsd);
+
+    const selectedLeverage = Number(leverage);
+
+    const maxOrder =
+      serverConfig?.maxOrderUsd ?? 1000;
+
+    const maxLeverage =
+      serverConfig?.maxLeverage ?? 10;
+
+    if (
+      !Number.isFinite(amount) ||
+      amount <= 0 ||
+      amount > maxOrder
+    ) {
+
+      setOrderMessage(
+        `Enter an order amount between $0 and $${maxOrder}.`
+      );
+
+      return;
+
+    }
+
+    if (
+      !Number.isInteger(selectedLeverage) ||
+      selectedLeverage < 1 ||
+      selectedLeverage > maxLeverage
+    ) {
+
+      setOrderMessage(
+        `Leverage must be between 1 and ${maxLeverage}x.`
+      );
+
+      return;
+
+    }
+
+    // --------------------------------------------------
+    // PAPER MODE
+    // --------------------------------------------------
+
+    if (tradingMode === 'PAPER') {
+
+      const trade: PaperOrder = {
+
+        id: Date.now(),
+
+        symbol: selectedSymbol,
+
+        side: orderSide,
+
+        quantityUsd: amount,
+
+        leverage: selectedLeverage,
+
+        price: selectedAsset?.price || 0,
+
+        createdAt: new Date().toLocaleString(),
+
+        status: 'PAPER_SIMULATION'
+
+      };
+
+      setPaperOrders(previous => [
+        trade,
+        ...previous
+      ]);
+
+      setOrderMessage(
+        'Paper simulation created successfully. No Binance order was executed.'
+      );
+
+      pushAlert(
+        `Paper ${orderSide}: ${selectedSymbol}, ${amount} USDT`
+      );
+
+      return;
+
+    }
+
+    // --------------------------------------------------
+    // BINANCE DEMO MODE
+    // --------------------------------------------------
+
+    if (!isBinanceConnected) {
+
+      setOrderMessage(
+        'Binance Demo API is not connected.'
+      );
+
+      return;
+
+    }
+
+    const confirmed = window.confirm(
+
+      `Submit Binance Futures DEMO ${orderSide} MARKET order?\n\n` +
+
+      `Symbol: ${selectedSymbol}\n` +
+
+      `Notional: ${amount} USDT\n` +
+
+      `Leverage: ${selectedLeverage}x\n\n` +
+
+      'This submits an actual order to your Demo account.'
+
+    );
+
+    if (!confirmed) return;
+
+    setOrderLoading(true);
+
+    setOrderMessage('');
+
+    try {
+
+      const result = await executeBinanceOrder({
+
+        symbol: selectedSymbol,
+
+        side: orderSide,
+
+        quantityUsd: amount,
+
+        leverage: selectedLeverage
+
+      });
+
+      setOrderMessage(
+
+        `${result.message} Order ID: ${result.orderId || 'N/A'}`
+
+      );
+
+      pushAlert(
+        `Binance Demo order submitted: ${orderSide} ${selectedSymbol}.`
+      );
+
+      await refreshAccount();
+
+    } catch (error: any) {
+
+      setOrderMessage(
+        error?.message ||
+        'Binance Demo order failed.'
+      );
+
+      pushAlert(
+        `Order failed: ${error?.message || 'Unknown error'}`
+      );
+
+    } finally {
+
+      setOrderLoading(false);
+
+    }
+
+  };
+
+  // ====================================================
+  // UI STATUS
+  // ====================================================
+
+  const marketStatusColor =
+    connectionStatus === 'LIVE'
+      ? 'text-emerald-400'
+      : connectionStatus === 'OFFLINE'
+        ? 'text-rose-400'
+        : 'text-amber-400';
+
+  const marketStatusDot =
+    connectionStatus === 'LIVE'
+      ? 'bg-emerald-400'
+      : connectionStatus === 'OFFLINE'
+        ? 'bg-rose-400'
+        : 'bg-amber-400';
+
+  // ====================================================
+  // DASHBOARD
+  // ====================================================
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500 selection:text-slate-950">
-      <Header
-        activeTab={activeTab}
-        onTabChange={setActiveTab}
-        connectionStatus={connectionStatus}
-        latencyMs={latencyMs}
-        apiSettings={apiSettings}
-        onOpenApiModal={() => setIsApiModalOpen(true)}
-        onOpenPushTradeModal={() => setIsPushModalOpen(true)}
-        isAutoPilotActive={config.enabled}
-        activePositionsCount={positions.length}
-        unreadAlertsCount={unreadAlertsCount}
-        isAudioMuted={isMuted}
-        onToggleAudio={handleToggleAudio}
-        totalPnlUsd={totalUnrealizedPnlUsd}
-      />
 
-      <MarketTicker
-        assets={assets}
-        selectedSymbol={selectedSymbol}
-        onSelectSymbol={setSelectedSymbol}
-      />
+    <div className="
+      min-h-screen bg-[#080d18]
+      text-slate-200 font-mono
+    ">
 
-      <main className="flex-1 max-w-7xl w-full mx-auto p-3 sm:p-4 space-y-4">
-        {activeTab === 'dashboard' && (
-          <div className="space-y-4">
-            <AutoPilotControls
-              config={config}
-              onUpdateConfig={(updates) => setConfig((prev) => ({ ...prev, ...updates }))}
-              isScanning={isScanning}
-              onManualScanNow={executeScan}
-              activeTradesCount={positions.length}
-              onCloseAllTrades={handleCloseAllTrades}
-            />
+      {/* ==================================================
+          HEADER
+      ================================================== */}
 
-            <CandleChart
-              assets={assets}
-              selectedSymbol={selectedSymbol}
-              onSelectSymbol={setSelectedSymbol}
-              activePositions={positions}
-              onOpenPushTrade={(sym) => {
-                setSelectedSymbol(sym);
-                setIsPushModalOpen(true);
-              }}
-            />
+      <header className="
+        sticky top-0 z-30
+        bg-[#101725]/95
+        backdrop-blur-xl
+        border-b border-slate-800
+      ">
 
-            <ActivePositions
-              positions={positions}
-              onClosePosition={handleClosePosition}
-              onMoveBreakeven={handleMoveBreakeven}
-              onPartialTakeProfit={handlePartialTakeProfit}
-            />
+        <div className="
+          max-w-[1600px] mx-auto
+          px-4 lg:px-8 py-4
+          flex flex-wrap items-center
+          justify-between gap-4
+        ">
 
-            <ScannerMatrix
-              assets={assets}
-              onSelectSymbol={setSelectedSymbol}
-              onPushTrade={(asset, dir) => {
-                setSelectedSymbol(asset.symbol);
-                setIsPushModalOpen(true);
-              }}
-              config={config}
-              isScanning={isScanning}
-            />
-          </div>
-        )}
+          <div className="flex items-center gap-3">
 
-        {activeTab === 'scanner' && (
-          <div className="space-y-4">
-            <AutoPilotControls
-              config={config}
-              onUpdateConfig={(updates) => setConfig((prev) => ({ ...prev, ...updates }))}
-              isScanning={isScanning}
-              onManualScanNow={executeScan}
-              activeTradesCount={positions.length}
-              onCloseAllTrades={handleCloseAllTrades}
-            />
-
-            <ScannerMatrix
-              assets={assets}
-              onSelectSymbol={(sym) => {
-                setSelectedSymbol(sym);
-                setActiveTab('dashboard');
-              }}
-              onPushTrade={(asset, dir) => {
-                setSelectedSymbol(asset.symbol);
-                setIsPushModalOpen(true);
-              }}
-              config={config}
-              isScanning={isScanning}
-            />
-          </div>
-        )}
-
-        {activeTab === 'positions' && (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-base font-bold text-white">Active Positions Management</h2>
-              <button
-                onClick={() => setIsRiskModalOpen(true)}
-                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700"
-              >
-                Calculate Safe Risk Size
-              </button>
+            <div className="
+              w-11 h-11 rounded-xl
+              bg-gradient-to-br from-amber-400 to-orange-600
+              flex items-center justify-center
+              text-black font-black text-xl
+            ">
+              T
             </div>
 
-            <ActivePositions
-              positions={positions}
-              onClosePosition={handleClosePosition}
-              onMoveBreakeven={handleMoveBreakeven}
-              onPartialTakeProfit={handlePartialTakeProfit}
-            />
+            <div>
+
+              <h1 className="
+                text-xl font-black text-white
+              ">
+
+                TURBOSCALP
+
+                <span className="
+                  ml-2 text-amber-400 text-xs
+                ">
+                  AI
+                </span>
+
+              </h1>
+
+              <p className="
+                text-[10px] tracking-[0.2em]
+                text-slate-500
+              ">
+                REAL-TIME MARKET SCANNER
+              </p>
+
+            </div>
+
           </div>
+
+          <div className="
+            flex flex-wrap items-center gap-2
+          ">
+
+            {/* MARKET STATUS */}
+
+            <div className="
+              flex items-center gap-2
+              bg-slate-900 px-3 py-2
+              rounded-lg border border-slate-800
+            ">
+
+              <span className={`
+                w-2 h-2 rounded-full
+                ${marketStatusDot}
+                ${connectionStatus === 'LIVE'
+                  ? 'animate-pulse'
+                  : ''}
+              `}/>
+
+              <span className={`
+                text-[9px] font-bold
+                ${marketStatusColor}
+              `}>
+
+                {connectionStatus === 'LIVE'
+                  ? 'MARKET LIVE'
+                  : connectionStatus === 'OFFLINE'
+                    ? 'MARKET OFFLINE'
+                    : 'MARKET CONNECTING'
+                }
+
+              </span>
+
+            </div>
+
+            {/* API KEY STATUS */}
+
+            <div className={`
+              flex items-center gap-2
+              px-3 py-2 rounded-lg border
+              ${
+                isBinanceConnected
+                  ? 'bg-emerald-950/40 border-emerald-500/30'
+                  : 'bg-slate-900 border-slate-800'
+              }
+            `}>
+
+              <span className={`
+                w-2 h-2 rounded-full
+                ${
+                  isBinanceConnected
+                    ? 'bg-emerald-400'
+                    : 'bg-rose-400'
+                }
+              `}/>
+
+              <span className={`
+                text-[9px] font-bold
+                ${
+                  isBinanceConnected
+                    ? 'text-emerald-400'
+                    : 'text-rose-400'
+                }
+              `}>
+
+                {isBinanceConnected
+                  ? 'API KEY ACTIVE'
+                  : 'API KEY INACTIVE'
+                }
+
+              </span>
+
+            </div>
+
+            {/* MODE */}
+
+            <div className="
+              bg-slate-900 border border-slate-800
+              rounded-lg px-3 py-2 text-[9px]
+            ">
+
+              <span className="text-slate-500">
+                MODE:
+              </span>
+
+              <span className="
+                ml-2 font-bold text-amber-400
+              ">
+
+                {tradingMode === 'BINANCE_DEMO'
+                  ? 'FUTURES DEMO'
+                  : 'PAPER'
+                }
+
+              </span>
+
+            </div>
+
+            <button
+              onClick={() => setShowSettings(true)}
+              className="
+                bg-amber-400 hover:bg-amber-300
+                text-black font-bold
+                rounded-lg px-4 py-2 text-xs
+              "
+            >
+              API SETTINGS
+            </button>
+
+          </div>
+
+        </div>
+
+      </header>
+
+      <main className="
+        max-w-[1600px] mx-auto
+        px-4 lg:px-8 py-6 space-y-6
+      ">
+
+        {/* ==================================================
+            ENVIRONMENT NOTICE
+        ================================================== */}
+
+        <div className="
+          border border-amber-500/30
+          bg-amber-500/5
+          rounded-xl p-3 flex items-start gap-3
+        ">
+
+          <span className="text-amber-400 text-lg">
+            ⚠
+          </span>
+
+          <div>
+
+            <p className="
+              text-xs font-bold text-amber-300
+            ">
+              DEMO TRADING ENVIRONMENT
+            </p>
+
+            <p className="
+              text-[10px] text-slate-400
+              mt-1 leading-relaxed
+            ">
+
+              Binance USD-M Futures Demo only.
+              Live trading is disabled. Technical signals
+              are indicators and are not guaranteed predictions.
+
+            </p>
+
+          </div>
+
+        </div>
+
+        {/* ==================================================
+            BALANCE SUMMARY
+        ================================================== */}
+
+        {isBinanceConnected && (
+
+          <section className="
+            bg-[#111a29]
+            border border-emerald-500/30
+            rounded-2xl p-5
+          ">
+
+            <div className="
+              flex flex-wrap justify-between
+              items-center gap-3
+            ">
+
+              <div>
+
+                <div className="
+                  flex items-center gap-2
+                ">
+
+                  <h2 className="
+                    text-xs font-black text-white
+                  ">
+                    BINANCE FUTURES DEMO ACCOUNT
+                  </h2>
+
+                  <span className="
+                    px-2 py-1 rounded-md
+                    bg-emerald-500/10
+                    border border-emerald-500/30
+                    text-emerald-400 text-[9px] font-bold
+                  ">
+                    API KEY ACTIVE
+                  </span>
+
+                </div>
+
+                <p className="
+                  text-[10px] text-slate-500 mt-2
+                ">
+                  Authenticated account balance
+                </p>
+
+              </div>
+
+              <button
+                onClick={() => void refreshAccount()}
+                disabled={accountLoading}
+                className="
+                  px-3 py-2 rounded-lg
+                  bg-emerald-500/10
+                  border border-emerald-500/30
+                  text-emerald-400 text-[10px] font-bold
+                  disabled:opacity-50
+                "
+              >
+                {accountLoading
+                  ? 'REFRESHING...'
+                  : 'REFRESH BALANCE ↻'
+                }
+              </button>
+
+            </div>
+
+            <div className="
+              grid grid-cols-1 sm:grid-cols-2
+              lg:grid-cols-3 gap-3 mt-5
+            ">
+
+              <MetricCard
+                title="WALLET BALANCE"
+                value={formatMoney(
+                  Number(account.totalWalletBalance)
+                )}
+                subtitle="Futures wallet USDT"
+                color="text-emerald-400"
+              />
+
+              <MetricCard
+                title="AVAILABLE BALANCE"
+                value={formatMoney(
+                  Number(account.availableBalance)
+                )}
+                subtitle="Available USDT for margin"
+                color="text-cyan-400"
+              />
+
+              <MetricCard
+                title="UNREALIZED PNL"
+                value={formatMoney(
+                  Number(account.totalUnrealizedProfit)
+                )}
+                subtitle="Open position PNL"
+                color={
+                  Number(account.totalUnrealizedProfit) >= 0
+                    ? 'text-emerald-400'
+                    : 'text-rose-400'
+                }
+              />
+
+            </div>
+
+            <div className="
+              flex flex-wrap justify-between
+              items-center gap-2 mt-4
+              border-t border-slate-800 pt-3
+            ">
+
+              <span className="
+                text-[10px] text-slate-400
+              ">
+                Futures trading permission
+              </span>
+
+              <span className={`
+                text-[10px] font-bold
+                ${
+                  account.canTrade
+                    ? 'text-emerald-400'
+                    : 'text-amber-400'
+                }
+              `}>
+                {account.canTrade
+                  ? 'ENABLED'
+                  : 'DISABLED / NOT CONFIRMED'
+                }
+              </span>
+
+            </div>
+
+            {accountError && (
+
+              <p className="
+                text-[10px] text-rose-400 mt-3
+              ">
+                {accountError}
+              </p>
+
+            )}
+
+          </section>
+
         )}
 
-        {activeTab === 'analytics' && (
-          <div className="space-y-4">
-            <TrackRecord
-              closedTrades={closedTrades}
-              stats={performanceStats}
-            />
-          </div>
-        )}
+        {/* ==================================================
+            MAIN METRICS
+        ================================================== */}
 
-        {activeTab === 'alerts' && (
-          <div className="space-y-4">
-            <AlertsPanel
-              alerts={alerts}
-              onClearAlerts={() => setAlerts([])}
-              onMarkRead={(id) =>
-                setAlerts((prev) => prev.map((a) => (a.id === id ? { ...a, read: true } : a)))
-              }
-              customRules={customRules}
-              onAddRule={(rule) =>
-                setCustomRules((prev) => [
-                  ...prev,
-                  {
-                    ...rule,
-                    id: `RULE-${Date.now()}`,
-                    triggered: false,
-                    active: true,
-                    createdAt: Date.now(),
-                  },
-                ])
-              }
-              onToggleRule={(id) =>
-                setCustomRules((prev) =>
-                  prev.map((r) => (r.id === id ? { ...r, active: !r.active } : r))
-                )
-              }
-              onDeleteRule={(id) =>
-                setCustomRules((prev) => prev.filter((r) => r.id !== id))
-              }
-              assets={assets}
-            />
+        <section className="
+          grid grid-cols-2 lg:grid-cols-4 gap-3
+        ">
+
+          <MetricCard
+            title="MARKETS TRACKED"
+            value={`${liveMarketCount}/${assets.length}`}
+            subtitle="Receiving market prices"
+            color="text-cyan-400"
+          />
+
+          <MetricCard
+            title="BUY SIGNALS"
+            value={String(buySignals)}
+            subtitle="EMA / RSI heuristic"
+            color="text-emerald-400"
+          />
+
+          <MetricCard
+            title="SELL SIGNALS"
+            value={String(sellSignals)}
+            subtitle="EMA / RSI heuristic"
+            color="text-rose-400"
+          />
+
+          <MetricCard
+            title="SCANNER STATUS"
+            value={scannerRunning ? 'ACTIVE' : 'PAUSED'}
+            subtitle="15-minute candle analysis"
+            color={
+              scannerRunning
+                ? 'text-emerald-400'
+                : 'text-amber-400'
+            }
+          />
+
+        </section>
+
+        {/* ==================================================
+            MARKET SCANNER AND TRADE TERMINAL
+        ================================================== */}
+
+        <section className="
+          grid grid-cols-1 xl:grid-cols-3 gap-5
+        ">
+
+          {/* MARKET SCANNER */}
+
+          <div className="
+            xl:col-span-2
+            bg-[#111a29]
+            border border-slate-800
+            rounded-2xl overflow-hidden
+          ">
+
+            <div className="
+              p-5 border-b border-slate-800
+              flex flex-wrap justify-between
+              items-center gap-3
+            ">
+
+              <div>
+
+                <h2 className="
+                  text-sm font-black text-white
+                ">
+                  MARKET SCANNER
+                </h2>
+
+                <p className="
+                  text-[10px] text-slate-500 mt-1
+                ">
+                  Binance Futures Demo market feed
+                </p>
+
+              </div>
+
+              <button
+                onClick={() =>
+                  setScannerRunning(value => !value)
+                }
+                className={`
+                  px-3 py-2 rounded-lg
+                  text-[10px] font-bold
+                  ${
+                    scannerRunning
+                      ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                      : 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
+                  }
+                `}
+              >
+
+                {scannerRunning
+                  ? 'PAUSE SCANNER'
+                  : 'START SCANNER'
+                }
+
+              </button>
+
+            </div>
+
+            {/* SEARCH */}
+
+            <div className="
+              p-4 border-b border-slate-800
+            ">
+
+              <input
+                value={search}
+                onChange={event =>
+                  setSearch(event.target.value)
+                }
+                placeholder="Search BTC, ETH, SOL..."
+                className="
+                  w-full bg-[#080d18]
+                  border border-slate-700
+                  rounded-lg px-4 py-3
+                  text-xs text-white outline-none
+                  focus:border-amber-400
+                "
+              />
+
+            </div>
+
+            {/* MARKET TABLE */}
+
+            <div className="overflow-x-auto">
+
+              <table className="
+                w-full text-left whitespace-nowrap
+              ">
+
+                <thead className="
+                  bg-[#0c1320]
+                  text-[9px] text-slate-500 uppercase
+                ">
+
+                  <tr>
+
+                    <th className="p-4">Asset</th>
+
+                    <th className="p-4">Price</th>
+
+                    <th className="p-4">24H %</th>
+
+                    <th className="p-4">Volume</th>
+
+                    <th className="p-4">RSI</th>
+
+                    <th className="p-4">Signal</th>
+
+                  </tr>
+
+                </thead>
+
+                <tbody>
+
+                  {filteredAssets.map(asset => (
+
+                    <tr
+                      key={asset.symbol}
+                      onClick={() =>
+                        setSelectedSymbol(asset.symbol)
+                      }
+                      className={`
+                        cursor-pointer
+                        border-b border-slate-800/70
+                        hover:bg-slate-800/40
+                        ${
+                          selectedSymbol === asset.symbol
+                            ? 'bg-amber-500/5'
+                            : ''
+                        }
+                      `}
+                    >
+
+                      <td className="p-4">
+
+                        <div className="
+                          text-xs font-bold text-white
+                        ">
+                          {asset.symbol.replace('USDT', '')}
+                        </div>
+
+                        <div className="
+                          text-[9px] text-slate-500 mt-1
+                        ">
+                          {asset.name}
+                        </div>
+
+                      </td>
+
+                      <td className="
+                        p-4 text-xs font-bold text-white
+                      ">
+                        {formatPrice(asset.price)}
+                      </td>
+
+                      <td className="
+                        p-4 text-xs font-bold
+                      ">
+
+                        <span className={
+                          asset.change24h >= 0
+                            ? 'text-emerald-400'
+                            : 'text-rose-400'
+                        }>
+
+                          {asset.price > 0
+                            ? `${asset.change24h >= 0 ? '+' : ''}${asset.change24h.toFixed(2)}%`
+                            : '—'
+                          }
+
+                        </span>
+
+                      </td>
+
+                      <td className="
+                        p-4 text-[10px] text-slate-400
+                      ">
+                        {asset.volume24h > 0
+                          ? formatVolume(asset.volume24h)
+                          : '—'
+                        }
+                      </td>
+
+                      <td className="
+                        p-4 text-xs text-slate-300
+                      ">
+                        {asset.rsi !== null
+                          ? asset.rsi.toFixed(1)
+                          : '—'
+                        }
+                      </td>
+
+                      <td className="p-4">
+
+                        <SignalBadge
+                          signal={asset.signal}
+                        />
+
+                      </td>
+
+                    </tr>
+
+                  ))}
+
+                </tbody>
+
+              </table>
+
+              {filteredAssets.length === 0 && (
+
+                <div className="
+                  text-center p-8
+                  text-xs text-slate-500
+                ">
+                  No matching market found.
+                </div>
+
+              )}
+
+            </div>
+
+            {scanError && (
+
+              <div className="
+                px-4 py-3
+                text-[10px] text-rose-400
+                border-t border-slate-800
+              ">
+                {scanError}
+              </div>
+
+            )}
+
+            <div className="
+              p-4 border-t border-slate-800
+              flex justify-between items-center
+            ">
+
+              <span className="
+                text-[10px] text-slate-500
+              ">
+                Technical scan: every 60 seconds
+              </span>
+
+              <button
+                onClick={() => void runTechnicalScanner()}
+                disabled={scannerLoading}
+                className="
+                  text-[10px] text-amber-400
+                  disabled:opacity-50
+                "
+              >
+
+                {scannerLoading
+                  ? 'SCANNING...'
+                  : 'REFRESH SCAN ↻'
+                }
+
+              </button>
+
+            </div>
+
           </div>
-        )}
+
+          {/* TRADE TERMINAL */}
+
+          <div className="
+            bg-[#111a29]
+            border border-slate-800
+            rounded-2xl p-5 space-y-5
+          ">
+
+            <div>
+
+              <h2 className="
+                text-sm font-black text-white
+              ">
+                TRADE TERMINAL
+              </h2>
+
+              <p className="
+                text-[10px] text-slate-500 mt-1
+              ">
+                Manual Demo execution
+              </p>
+
+            </div>
+
+            {/* MARKET */}
+
+            <div className="
+              rounded-xl bg-[#080d18]
+              p-4 border border-slate-800
+            ">
+
+              <label className="
+                block mb-3 text-[9px]
+                text-slate-500
+              ">
+                SELECT MARKET
+              </label>
+
+              <select
+                value={selectedSymbol}
+                onChange={event => {
+                  setSelectedSymbol(event.target.value);
+                  setOrderMessage('');
+                }}
+                className="
+                  w-full bg-slate-900
+                  border border-slate-700
+                  text-white text-xs rounded-lg
+                  px-3 py-3 outline-none
+                "
+              >
+
+                {assets.map(asset => (
+
+                  <option
+                    key={asset.symbol}
+                    value={asset.symbol}
+                  >
+                    {asset.symbol}
+                  </option>
+
+                ))}
+
+              </select>
+
+              <div className="
+                mt-3 flex justify-between
+              ">
+
+                <span className="
+                  text-[10px] text-slate-500
+                ">
+                  MARKET PRICE
+                </span>
+
+                <span className="
+                  font-bold text-white text-sm
+                ">
+                  {formatPrice(
+                    selectedAsset?.price || 0
+                  )}
+                </span>
+
+              </div>
+
+            </div>
+
+            {/* BUY / SELL */}
+
+            <div className="
+              grid grid-cols-2 gap-2
+            ">
+
+              <button
+                onClick={() => {
+                  setOrderSide('BUY');
+                  setOrderMessage('');
+                }}
+                className={`
+                  py-3 rounded-lg
+                  text-xs font-black border
+                  ${
+                    orderSide === 'BUY'
+                      ? 'bg-emerald-500 text-black border-emerald-400'
+                      : 'bg-slate-900 text-slate-400 border-slate-700'
+                  }
+                `}
+              >
+                BUY / LONG
+              </button>
+
+              <button
+                onClick={() => {
+                  setOrderSide('SELL');
+                  setOrderMessage('');
+                }}
+                className={`
+                  py-3 rounded-lg
+                  text-xs font-black border
+                  ${
+                    orderSide === 'SELL'
+                      ? 'bg-rose-500 text-white border-rose-400'
+                      : 'bg-slate-900 text-slate-400 border-slate-700'
+                  }
+                `}
+              >
+                SELL / SHORT
+              </button>
+
+            </div>
+
+            {/* ORDER NOTIONAL */}
+
+            <div>
+
+              <label className="
+                text-[10px] text-slate-500
+                block mb-2
+              ">
+                ORDER NOTIONAL (USDT)
+              </label>
+
+              <input
+                type="number"
+                min="1"
+                value={quantityUsd}
+                onChange={event =>
+                  setQuantityUsd(event.target.value)
+                }
+                className="
+                  w-full p-3 rounded-lg
+                  bg-[#080d18]
+                  border border-slate-700
+                  text-white text-sm
+                  outline-none focus:border-amber-400
+                "
+              />
+
+            </div>
+
+            {/* LEVERAGE */}
+
+            <div>
+
+              <label className="
+                text-[10px] text-slate-500
+                block mb-2
+              ">
+                LEVERAGE
+              </label>
+
+              <select
+                value={leverage}
+                onChange={event =>
+                  setLeverage(event.target.value)
+                }
+                className="
+                  w-full p-3 rounded-lg
+                  bg-[#080d18]
+                  border border-slate-700
+                  text-white text-xs
+                "
+              >
+
+                {[1, 2, 3, 5, 10, 15, 20].map(value => (
+
+                  <option
+                    key={value}
+                    value={value}
+                  >
+                    {value}x
+                  </option>
+
+                ))}
+
+              </select>
+
+            </div>
+
+            {/* SUMMARY */}
+
+            <div className="
+              bg-[#080d18]
+              border border-slate-800
+              rounded-lg p-3 space-y-2
+            ">
+
+              <div className="
+                flex justify-between text-[10px]
+              ">
+
+                <span className="text-slate-500">
+                  Notional
+                </span>
+
+                <span className="text-white">
+                  {formatMoney(Number(quantityUsd))}
+                </span>
+
+              </div>
+
+              <div className="
+                flex justify-between text-[10px]
+              ">
+
+                <span className="text-slate-500">
+                  Approx. margin
+                </span>
+
+                <span className="text-amber-400">
+                  {formatMoney(
+                    Number(quantityUsd) /
+                    Math.max(Number(leverage), 1)
+                  )}
+                </span>
+
+              </div>
+
+              <div className="
+                flex justify-between text-[10px]
+              ">
+
+                <span className="text-slate-500">
+                  Execution
+                </span>
+
+                <span className="text-emerald-400">
+                  MARKET
+                </span>
+
+              </div>
+
+            </div>
+
+            {/* VALIDATE ORDER */}
+
+            <button
+              onClick={() => void validateOrder()}
+              disabled={orderLoading}
+              className="
+                w-full py-3 rounded-lg
+                border border-slate-600
+                bg-slate-800 hover:bg-slate-700
+                text-white text-xs font-bold
+                disabled:opacity-50
+              ">
+              VALIDATE ORDER (NO EXECUTION)
+            </button>
+
+            {/* PLACE ORDER */}
+
+            <button
+              onClick={() => void placeOrder()}
+              disabled={orderLoading}
+              className={`
+                w-full py-4 rounded-lg
+                font-black text-xs
+                disabled:opacity-50
+                ${
+                  orderSide === 'BUY'
+                    ? 'bg-emerald-500 hover:bg-emerald-400 text-black'
+                    : 'bg-rose-500 hover:bg-rose-400 text-white'
+                }
+              `}
+            >
+
+              {orderLoading
+                ? 'PROCESSING...'
+                : tradingMode === 'PAPER'
+                  ? `SIMULATE ${orderSide} TRADE`
+                  : `PLACE DEMO ${orderSide} ORDER`
+              }
+
+            </button>
+
+            {orderMessage && (
+
+              <div className="
+                p-3 rounded-lg
+                bg-slate-900
+                border border-slate-700
+                text-[10px] leading-relaxed
+                text-slate-300
+              ">
+                {orderMessage}
+              </div>
+
+            )}
+
+            <p className="
+              text-[9px] text-slate-500 text-center
+            ">
+              Live trading is disabled.
+            </p>
+
+          </div>
+
+        </section>
+
+        {/* ==================================================
+            ACCOUNT DETAILS
+        ================================================== */}
+
+        <section className="
+          bg-[#111a29]
+          border border-slate-800
+          rounded-2xl overflow-hidden
+        ">
+
+          <div className="
+            p-5 flex flex-wrap
+            justify-between items-center gap-3
+            border-b border-slate-800
+          ">
+
+            <div>
+
+              <h2 className="
+                text-sm font-black text-white
+              ">
+                BINANCE DEMO ACCOUNT DETAILS
+              </h2>
+
+              <p className="
+                text-[10px] text-slate-500 mt-1
+              ">
+                Positions and open orders
+              </p>
+
+            </div>
+
+            <button
+              onClick={() => void refreshAccount()}
+              disabled={
+                accountLoading ||
+                !isBinanceConnected
+              }
+              className="
+                px-4 py-2 rounded-lg
+                bg-amber-400 hover:bg-amber-300
+                text-black text-[10px] font-black
+                disabled:opacity-50
+              "
+            >
+
+              {accountLoading
+                ? 'LOADING...'
+                : 'REFRESH ACCOUNT'
+              }
+
+            </button>
+
+          </div>
+
+          {accountError && (
+
+            <div className="
+              p-3 border-b border-slate-800
+              text-[10px] text-rose-400
+            ">
+              {accountError}
+            </div>
+
+          )}
+
+          <div className="
+            grid grid-cols-1 lg:grid-cols-2
+            border-t border-slate-800
+          ">
+
+            {/* POSITIONS */}
+
+            <div className="
+              p-5 lg:border-r border-slate-800
+            ">
+
+              <h3 className="
+                text-xs font-bold text-white mb-4
+              ">
+                OPEN POSITIONS ({positions.length})
+              </h3>
+
+              {positions.length === 0 ? (
+
+                <p className="
+                  text-[10px] text-slate-500 py-5
+                ">
+                  No open positions loaded.
+                </p>
+
+              ) : (
+
+                <div className="space-y-3">
+
+                  {positions.map((position, index) => (
+
+                    <div
+                      key={`${position.symbol}-${index}`}
+                      className="
+                        p-3 bg-[#080d18]
+                        border border-slate-800 rounded-lg
+                      "
+                    >
+
+                      <div className="
+                        flex justify-between
+                      ">
+
+                        <span className="
+                          text-xs font-bold text-white
+                        ">
+                          {position.symbol}
+                        </span>
+
+                        <span className="
+                          text-[10px] text-amber-400
+                        ">
+                          {position.leverage}x
+                        </span>
+
+                      </div>
+
+                      <div className="
+                        mt-3 grid grid-cols-2 gap-3
+                      ">
+
+                        <PositionValue
+                          title="Position Size"
+                          value={position.positionAmt}
+                        />
+
+                        <PositionValue
+                          title="Entry Price"
+                          value={formatPrice(
+                            Number(position.entryPrice)
+                          )}
+                        />
+
+                        <PositionValue
+                          title="Mark Price"
+                          value={formatPrice(
+                            Number(position.markPrice)
+                          )}
+                        />
+
+                        <PositionValue
+                          title="Unrealized PNL"
+                          value={formatMoney(
+                            Number(position.unrealizedProfit)
+                          )}
+                        />
+
+                      </div>
+
+                    </div>
+
+                  ))}
+
+                </div>
+
+              )}
+
+            </div>
+
+            {/* OPEN ORDERS */}
+
+            <div className="p-5">
+
+              <h3 className="
+                text-xs font-bold text-white mb-4
+              ">
+                OPEN ORDERS ({openOrders.length})
+              </h3>
+
+              {openOrders.length === 0 ? (
+
+                <p className="
+                  text-[10px] text-slate-500 py-5
+                ">
+                  No open orders loaded.
+                </p>
+
+              ) : (
+
+                <div className="space-y-2">
+
+                  {openOrders.map((order: any) => (
+
+                    <div
+                      key={order.orderId}
+                      className="
+                        p-3 bg-[#080d18]
+                        border border-slate-800
+                        rounded-lg flex justify-between gap-3
+                      "
+                    >
+
+                      <div>
+
+                        <p className="
+                          text-xs font-bold text-white
+                        ">
+                          {order.symbol}
+                        </p>
+
+                        <p className="
+                          text-[10px] text-slate-500 mt-1
+                        ">
+                          {order.side} / {order.type}
+                        </p>
+
+                      </div>
+
+                      <div className="text-right">
+
+                        <p className="
+                          text-[10px] text-amber-400
+                        ">
+                          {order.status}
+                        </p>
+
+                        <p className="
+                          text-[10px] text-slate-400 mt-1
+                        ">
+                          ID: {order.orderId}
+                        </p>
+
+                      </div>
+
+                    </div>
+
+                  ))}
+
+                </div>
+
+              )}
+
+            </div>
+
+          </div>
+
+        </section>
+
+        {/* ==================================================
+            PAPER TRADING HISTORY
+        ================================================== */}
+
+        <section className="
+          bg-[#111a29]
+          border border-slate-800
+          rounded-2xl p-5
+        ">
+
+          <div className="
+            flex justify-between items-center mb-4
+          ">
+
+            <h2 className="
+              text-sm font-black text-white
+            ">
+              PAPER TRADING HISTORY
+            </h2>
+
+            <span className="
+              text-[10px] text-slate-500
+            ">
+              {paperOrders.length} simulations
+            </span>
+
+          </div>
+
+          {paperOrders.length === 0 ? (
+
+            <p className="
+              text-[10px] text-slate-500
+            ">
+              No paper trades yet.
+            </p>
+
+          ) : (
+
+            <div className="overflow-x-auto">
+
+              <table className="
+                w-full text-left text-[10px]
+              ">
+
+                <thead className="
+                  text-slate-500
+                  border-b border-slate-800
+                ">
+
+                  <tr>
+
+                    <th className="py-3 pr-4">Time</th>
+
+                    <th className="py-3 pr-4">Symbol</th>
+
+                    <th className="py-3 pr-4">Side</th>
+
+                    <th className="py-3 pr-4">Notional</th>
+
+                    <th className="py-3 pr-4">Leverage</th>
+
+                    <th className="py-3">Status</th>
+
+                  </tr>
+
+                </thead>
+
+                <tbody>
+
+                  {paperOrders.map(order => (
+
+                    <tr
+                      key={order.id}
+                      className="border-b border-slate-800/50"
+                    >
+
+                      <td className="
+                        py-3 pr-4 text-slate-400
+                      ">
+                        {order.createdAt}
+                      </td>
+
+                      <td className="
+                        py-3 pr-4 text-white font-bold
+                      ">
+                        {order.symbol}
+                      </td>
+
+                      <td className={`
+                        py-3 pr-4 font-bold
+                        ${
+                          order.side === 'BUY'
+                            ? 'text-emerald-400'
+                            : 'text-rose-400'
+                        }
+                      `}>
+                        {order.side}
+                      </td>
+
+                      <td className="
+                        py-3 pr-4 text-white
+                      ">
+                        {formatMoney(order.quantityUsd)}
+                      </td>
+
+                      <td className="
+                        py-3 pr-4 text-amber-400
+                      ">
+                        {order.leverage}x
+                      </td>
+
+                      <td className="
+                        py-3 text-slate-400
+                      ">
+                        PAPER ONLY
+                      </td>
+
+                    </tr>
+
+                  ))}
+
+                </tbody>
+
+              </table>
+
+            </div>
+
+          )}
+
+        </section>
+
+        {/* ==================================================
+            SYSTEM ACTIVITY
+        ================================================== */}
+
+        <section className="
+          bg-[#111a29]
+          border border-slate-800
+          rounded-2xl overflow-hidden
+        ">
+
+          <div className="
+            p-5 border-b border-slate-800
+          ">
+
+            <h2 className="
+              text-sm font-black text-white
+            ">
+              SYSTEM ACTIVITY
+            </h2>
+
+            <p className="
+              text-[10px] text-slate-500 mt-1
+            ">
+              Market, API connection and trading events
+            </p>
+
+          </div>
+
+          <div className="
+            p-4 space-y-3
+            max-h-64 overflow-y-auto
+          ">
+
+            {alerts.map((alert, index) => (
+
+              <div
+                key={`${alert}-${index}`}
+                className="
+                  text-[10px] text-slate-400
+                  flex gap-3
+                "
+              >
+
+                <span className="text-emerald-500">
+                  ›
+                </span>
+
+                <span>
+                  {alert}
+                </span>
+
+              </div>
+
+            ))}
+
+          </div>
+
+        </section>
+
+        {/* FOOTER */}
+
+        <footer className="
+          py-6 border-t border-slate-800
+          flex flex-wrap justify-between gap-3
+        ">
+
+          <p className="
+            text-[10px] text-slate-600
+          ">
+            TURBOSCALP AI · BINANCE DEMO
+          </p>
+
+          <p className="
+            text-[10px] text-slate-600
+          ">
+            Live trading disabled
+          </p>
+
+        </footer>
+
       </main>
 
-      <PushTradeModal
-        isOpen={isPushModalOpen}
-        onClose={() => setIsPushModalOpen(false)}
-        assets={assets}
-        initialSymbol={selectedSymbol}
-        onExecutePushTrade={handleManualPushTrade}
-        apiSettings={apiSettings}
-      />
+      {/* ==================================================
+          API SETTINGS MODAL
+      ================================================== */}
 
       <ApiSettingsModal
-        isOpen={isApiModalOpen}
-        onClose={() => setIsApiModalOpen(false)}
-        settings={apiSettings}
-        onSaveSettings={(newSettings: any) => setApiSettings(newSettings)}
+
+        isOpen={showSettings}
+
+        onClose={() => setShowSettings(false)}
+
+        connected={isBinanceConnected}
+
+        walletBalance={
+          Number(account.totalWalletBalance) || 0
+        }
+
+        availableBalance={
+          Number(account.availableBalance) || 0
+        }
+
+        canTrade={account.canTrade}
+
+        onConnectionChange={handleConnectionChange}
+
       />
 
-      <RiskCalculatorModal
-        isOpen={isRiskModalOpen}
-        onClose={() => setIsRiskModalOpen(false)}
-        defaultPrice={assets.find((a) => a.symbol === selectedSymbol)?.price || 90000}
-        accountBalance={
-          apiSettings.network === 'DEMO_PAPER'
-            ? apiSettings.demoBalance || 10000
-            : apiSettings.usdtBalance || 0
-        }
-      />
     </div>
+
   );
+
+}
+
+// ======================================================
+// METRIC CARD
+// ======================================================
+
+function MetricCard({
+  title,
+  value,
+  subtitle,
+  color
+}: {
+  title: string;
+  value: string;
+  subtitle: string;
+  color: string;
+}) {
+
+  return (
+
+    <div className="
+      bg-[#111a29]
+      border border-slate-800
+      rounded-xl p-4 min-w-0
+    ">
+
+      <p className="
+        text-[9px] text-slate-500 tracking-wider
+      ">
+        {title}
+      </p>
+
+      <p className={`
+        text-xl sm:text-2xl
+        font-black mt-3 ${color}
+      `}>
+        {value}
+      </p>
+
+      <p className="
+        text-[9px] text-slate-500 mt-2
+      ">
+        {subtitle}
+      </p>
+
+    </div>
+
+  );
+
+}
+
+// ======================================================
+// SIGNAL BADGE
+// ======================================================
+
+function SignalBadge({
+  signal
+}: {
+  signal: SignalType;
+}) {
+
+  const styles = {
+
+    BUY:
+      'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
+
+    SELL:
+      'bg-rose-500/10 text-rose-400 border-rose-500/30',
+
+    NEUTRAL:
+      'bg-slate-800 text-slate-400 border-slate-700'
+
+  };
+
+  return (
+
+    <span className={`
+      inline-block px-2 py-1
+      rounded-md text-[9px]
+      font-bold border ${styles[signal]}
+    `}>
+      {signal}
+    </span>
+
+  );
+
+}
+
+// ======================================================
+// POSITION VALUE
+// ======================================================
+
+function PositionValue({
+  title,
+  value
+}: {
+  title: string;
+  value: string;
+}) {
+
+  return (
+
+    <div>
+
+      <p className="
+        text-[9px] text-slate-500
+      ">
+        {title}
+      </p>
+
+      <p className="
+        text-[11px] text-white mt-1 break-all
+      ">
+        {value}
+      </p>
+
+    </div>
+
+  );
+
 }

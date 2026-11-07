@@ -1,105 +1,424 @@
-import { MarketAsset } from '../types';
 
-export const INITIAL_BINANCE_ASSETS: MarketAsset[] = [
-  { symbol: 'BTC/USDT', name: 'Bitcoin', price: 91400.0, high24h: 92500, low24h: 89800, change24h: 2.14, volume24h: '$2.8B', rsi: 58.4 },
-  { symbol: 'ETH/USDT', name: 'Ethereum', price: 3350.0, high24h: 3420, low24h: 3280, change24h: 3.42, volume24h: '$1.4B', rsi: 52.1 },
-  { symbol: 'SOL/USDT', name: 'Solana', price: 194.5, high24h: 198.2, low24h: 188.0, change24h: 4.85, volume24h: '$890M', rsi: 61.2 },
-  { symbol: 'XRP/USDT', name: 'Ripple', price: 2.35, high24h: 2.45, low24h: 2.22, change24h: 5.60, volume24h: '$640M', rsi: 55.0 },
-  { symbol: 'ADA/USDT', name: 'Cardano', price: 0.85, high24h: 0.89, low24h: 0.82, change24h: 2.30, volume24h: '$210M', rsi: 48.6 },
-  { symbol: 'DOGE/USDT', name: 'Dogecoin', price: 0.28, high24h: 0.30, low24h: 0.26, change24h: -1.25, volume24h: '$410M', rsi: 64.2 },
-];
+const SESSION_KEY = 'turboscalp_demo_session';
 
-export async function fetchBinanceKlines(symbol: string, interval: string = '15m', limit: number = 50): Promise<Array<any>> {
-  try {
-    const cleanSymbol = symbol.replace('/', '').toUpperCase();
-    const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${cleanSymbol}&interval=${interval}&limit=${limit}`);
-    const text = await res.text();
-    const data = text ? JSON.parse(text) : [];
-    if (Array.isArray(data)) {
-      return data.map((k: any[]) => ({
-        timestamp: k[0],
-        open: parseFloat(k[1]),
-        high: parseFloat(k[2]),
-        low: parseFloat(k[3]),
-        close: parseFloat(k[4]),
-        volume: parseFloat(k[5]),
-      }));
-    }
-    return [];
-  } catch (err) {
-    console.debug('Failed to fetch binance klines, returning mock fallback:', err);
-    return [];
-  }
+export interface BinanceConfig {
+  success: boolean;
+  environment: string;
+  credentialsConfigured: boolean;
+  liveTradingEnabled: boolean;
+  maxOrderUsd: number;
+  maxLeverage: number;
 }
 
-export async function executeBinancePushOrder(params: {
+export interface BinanceAccount {
+  success: boolean;
+  canTrade: boolean;
+  totalWalletBalance: string;
+  availableBalance: string;
+  totalUnrealizedProfit: string;
+  assets?: any[];
+}
+
+export interface BinanceConnectionResult {
+  success: boolean;
+  environment: string;
+  canTrade: boolean;
+  availableBalance: number;
+  walletBalance: number;
+  message: string;
+}
+
+export interface BinanceConnectionState {
+  connected: boolean;
+  walletBalance?: number;
+  availableBalance?: number;
+  canTrade?: boolean;
+}
+
+export interface BinanceOrder {
   symbol: string;
   side: 'BUY' | 'SELL';
-  type: string;
-  price: number;
   quantityUsd: number;
   leverage: number;
-  apiSettings: any;
-}) {
-  const { symbol, side, quantityUsd, leverage, apiSettings } = params;
+}
 
-  if (apiSettings.network === 'DEMO_PAPER') {
-    return {
-      success: true,
-      executedPrice: params.price,
-      message: `Demo Paper Mode: ${side} order executed successfully for ${symbol} with ${leverage}x leverage.`
-    };
+// ======================================================
+// TEMPORARY SESSION TOKEN
+// ======================================================
+
+function getSessionToken(): string {
+
+  try {
+
+    return sessionStorage.getItem(
+      SESSION_KEY
+    ) || '';
+
+  } catch {
+
+    return '';
+
+  }
+
+}
+
+function saveSessionToken(token: string): void {
+
+  if (!token) {
+    throw new Error('Server did not return a session token.');
   }
 
   try {
-    await fetch('/api/binance/check-orphans', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        symbol,
-        apiKey: apiSettings.apiKey,
-        secretKey: apiSettings.apiSecret
-      })
-    }).catch(() => {});
 
-    const quantity = Number((quantityUsd / params.price).toFixed(3));
-    const response = await fetch('/api/binance-proxy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        endpoint: '/fapi/v1/order',
-        method: 'POST',
-        data: {
-          symbol: symbol.replace('/', ''),
-          side,
-          type: 'MARKET',
-          quantity: Math.max(0.001, quantity),
-          leverage
-        },
-        apiKey: apiSettings.apiKey,
-        secretKey: apiSettings.apiSecret
-      })
-    });
+    sessionStorage.setItem(
+      SESSION_KEY,
+      token
+    );
 
-    const text = await response.text();
-    const data = text ? JSON.parse(text) : {};
+  } catch {
 
-    if (response.ok) {
-      return {
-        success: true,
-        executedPrice: data.avgPrice ? parseFloat(data.avgPrice) : params.price,
-        message: `Binance Futures Order Filled Successfully.`
-      };
-    } else {
-      return {
-        success: false,
-        message: data.details?.msg || data.error || 'Binance order rejected.'
-      };
-    }
-  } catch (err: any) {
-    return {
-      success: false,
-      message: err.message || 'Network error pushing trade to Binance.'
-    };
+    throw new Error(
+      'Unable to save the temporary connection session.'
+    );
+
   }
+
+}
+
+function clearSessionToken(): void {
+
+  try {
+
+    sessionStorage.removeItem(
+      SESSION_KEY
+    );
+
+  } catch {
+
+    // Nothing else to clear.
+
+  }
+
+}
+
+// ======================================================
+// GENERAL API REQUEST
+// ======================================================
+
+export async function apiRequest<T>(
+  endpoint: string,
+  options: RequestInit = {}
+): Promise<T> {
+
+  const headers = new Headers(options.headers || {});
+
+  if (options.body && !headers.has('Content-Type')) {
+
+    headers.set(
+      'Content-Type',
+      'application/json'
+    );
+
+  }
+
+  const token = getSessionToken();
+
+  if (token) {
+
+    headers.set(
+      'X-TS-Session',
+      token
+    );
+
+  }
+
+  const response = await fetch(endpoint, {
+
+    ...options,
+
+    credentials: 'same-origin',
+
+    cache: 'no-store',
+
+    headers
+
+  });
+
+  const data = await response
+    .json()
+    .catch(() => ({}));
+
+  if (!response.ok || data?.success === false) {
+
+    throw new Error(
+      data?.message ||
+      data?.msg ||
+      `Request failed: HTTP ${response.status}`
+    );
+
+  }
+
+  return data as T;
+
+}
+
+// ======================================================
+// MANUAL BINANCE CONNECTION
+// ======================================================
+
+export async function connectBinanceDemo(
+  apiKey: string,
+  apiSecret: string
+): Promise<BinanceConnectionResult> {
+
+  if (!apiKey.trim() || !apiSecret.trim()) {
+
+    throw new Error(
+      'API Key and API Secret are required.'
+    );
+
+  }
+
+  // This request is the only request that sends
+  // the exchange API Key and Secret from the browser.
+
+  const response = await fetch(
+    '/api/binance/connect',
+    {
+
+      method: 'POST',
+
+      credentials: 'same-origin',
+
+      cache: 'no-store',
+
+      headers: {
+        'Content-Type': 'application/json'
+      },
+
+      body: JSON.stringify({
+
+        apiKey: apiKey.trim(),
+
+        apiSecret: apiSecret.trim()
+
+      })
+
+    }
+  );
+
+  const data = await response
+    .json()
+    .catch(() => ({}));
+
+  if (!response.ok || data?.success !== true) {
+
+    throw new Error(
+      data?.message ||
+      'Binance authentication failed.'
+    );
+
+  }
+
+  // The server returns an application session token,
+  // NOT the Binance API key or secret.
+
+  saveSessionToken(data.sessionToken);
+
+  return data as BinanceConnectionResult;
+
+}
+
+// ======================================================
+// SERVER CONFIGURATION
+// ======================================================
+
+export async function getBinanceConfig():
+Promise<BinanceConfig> {
+
+  const result = await apiRequest<BinanceConfig>(
+    '/api/binance/config'
+  );
+
+  // An expired or invalid session is removed.
+
+  if (!result.credentialsConfigured) {
+
+    clearSessionToken();
+
+  }
+
+  return result;
+
+}
+
+// ======================================================
+// CONNECTION RECHECK
+// ======================================================
+
+export async function testBinanceConnection():
+Promise<{
+  success: boolean;
+  canTrade: boolean;
+  message: string;
+}> {
+
+  return apiRequest(
+    '/api/binance/test',
+    {
+      method: 'POST'
+    }
+  );
+
+}
+
+// ======================================================
+// ACCOUNT AND WALLET
+// ======================================================
+
+export async function getBinanceAccount():
+Promise<BinanceAccount> {
+
+  return apiRequest<BinanceAccount>(
+    '/api/binance/account'
+  );
+
+}
+
+// ======================================================
+// DISCONNECT
+// ======================================================
+
+export async function disconnectBinanceDemo():
+Promise<{
+  success: boolean;
+  message?: string;
+}> {
+
+  const result = await apiRequest<{
+    success: boolean;
+    message?: string;
+  }>(
+    '/api/binance/disconnect',
+    {
+      method: 'POST'
+    }
+  );
+
+  clearSessionToken();
+
+  return result;
+
+}
+
+// ======================================================
+// POSITIONS
+// ======================================================
+
+export async function getBinancePositions():
+
+Promise<{
+  success: boolean;
+  positions: any[];
+}> {
+
+  return apiRequest(
+    '/api/binance/positions'
+  );
+
+}
+
+// ======================================================
+// OPEN ORDERS
+// ======================================================
+
+export async function getBinanceOpenOrders():
+
+Promise<{
+  success: boolean;
+  orders: any[];
+}> {
+
+  return apiRequest(
+    '/api/binance/open-orders'
+  );
+
+}
+
+// ======================================================
+// HISTORICAL CANDLES
+// ======================================================
+
+export async function fetchBinanceKlines(
+  symbol: string,
+  interval = '15m',
+  limit = 100
+): Promise<any[]> {
+
+  const query = new URLSearchParams({
+
+    symbol: symbol.replace('/', '').toUpperCase(),
+
+    interval,
+
+    limit: String(
+      Math.min(
+        Math.max(limit, 1),
+        1000
+      )
+    )
+
+  });
+
+  const result = await apiRequest<{
+    success: boolean;
+    data: any[];
+  }>(
+    `/api/binance/klines?${query.toString()}`
+  );
+
+  return result.data || [];
+
+}
+
+// ======================================================
+// TEST ORDER
+// ======================================================
+
+export async function validateBinanceOrder(
+  order: BinanceOrder
+): Promise<any> {
+
+  return apiRequest(
+    '/api/binance/order-test',
+    {
+
+      method: 'POST',
+
+      body: JSON.stringify(order)
+
+    }
+  );
+
+}
+
+// ======================================================
+// EXECUTE DEMO ORDER
+// ======================================================
+
+export async function executeBinanceOrder(
+  order: BinanceOrder
+): Promise<any> {
+
+  return apiRequest(
+    '/api/binance/order',
+    {
+
+      method: 'POST',
+
+      body: JSON.stringify(order)
+
+    }
+  );
+
 }
