@@ -22,6 +22,7 @@ import {
 } from 'ws';
 
 import dotenv from 'dotenv';
+import { registerQuantRoutes } from './server/quantRoutes.js';
 
 dotenv.config();
 
@@ -44,7 +45,11 @@ app.use(express.json({
   limit: '32kb'
 }));
 
-const PORT = Number(process.env.PORT || 3000);
+// Public Demo-market quant scanner and paper-bot analysis API.
+registerQuantRoutes(app);
+
+// AI Studio dev server must strictly listen on port 3000
+const PORT = 3000;
 
 // ======================================================
 // BINANCE DEMO ENDPOINTS
@@ -1570,17 +1575,7 @@ async function configureApplication() {
       ),
 
       server: {
-
         middlewareMode: true,
-
-        // Vite HMR has its own path and
-        // uses the same HTTP server.
-
-        hmr: {
-          server,
-          path: '/__vite_hmr'
-        }
-
       },
 
       appType: 'spa'
