@@ -20,15 +20,6 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
   bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
 }
 
-async function sendTelegramAlert(message) {
-  if (!bot || !process.env.TELEGRAM_CHAT_ID) return;
-  try {
-    await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
-  } catch (err) {
-    console.error('Telegram error:', err.message);
-  }
-}
-
 // Secure Binance Futures Proxy
 app.post('/api/binance-proxy', async (req, res) => {
   try {
@@ -58,7 +49,7 @@ app.post('/api/binance-proxy', async (req, res) => {
 // Automated Check & Clear Orphaned Trades before new push order
 app.post('/api/binance/check-orphans', async (req, res) => {
   try {
-    const { symbol, apiKey, secretKey } = req.body;
+    const { symbol, apiKey } = req.body;
     const clientApiKey = apiKey || process.env.BINANCE_API_KEY;
     const headers = clientApiKey ? { 'X-MBX-APIKEY': clientApiKey } : {};
 

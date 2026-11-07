@@ -16,9 +16,6 @@ export const INITIAL_BINANCE_ASSETS: MarketAsset[] = [
   { symbol: 'DOGE/USDT', name: 'Dogecoin', price: 0.28, high24h: 0.30, low24h: 0.26, rsi: 64.2 },
 ];
 
-/**
- * Fetches historical klines (candlesticks) from Binance Futures REST API
- */
 export async function fetchBinanceKlines(symbol: string, interval: string = '15m', limit: number = 50): Promise<Array<any>> {
   try {
     const cleanSymbol = symbol.replace('/', '').toUpperCase();
@@ -42,9 +39,6 @@ export async function fetchBinanceKlines(symbol: string, interval: string = '15m
   }
 }
 
-/**
- * Executes a Binance Futures Push Order with automated pre-check and orphaned order cleaning
- */
 export async function executeBinancePushOrder(params: {
   symbol: string;
   side: 'BUY' | 'SELL';
@@ -65,7 +59,6 @@ export async function executeBinancePushOrder(params: {
   }
 
   try {
-    // 1. Automatically check and clear any orphaned/stuck trades or open orders for this symbol first
     await fetch('/api/binance/check-orphans', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -76,7 +69,6 @@ export async function executeBinancePushOrder(params: {
       })
     }).catch(() => {});
 
-    // 2. Execute live futures order via backend AWS proxy
     const quantity = Number((quantityUsd / params.price).toFixed(3));
     const response = await fetch('/api/binance-proxy', {
       method: 'POST',

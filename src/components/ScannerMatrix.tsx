@@ -1,7 +1,7 @@
 import React from 'react';
 import { MarketAsset, AutoPilotConfig } from '../types';
 import { evaluateMarketAsset } from '../utils/tradingEngine';
-import { ShieldCheck, Zap, TrendingUp, TrendingDown, Activity, Play } from 'lucide-react';
+import { Zap, TrendingUp, TrendingDown, Activity, Play } from 'lucide-react';
 
 interface ScannerMatrixProps {
   assets: MarketAsset[];
@@ -121,7 +121,6 @@ export function ScannerMatrix({
               <div className="flex flex-wrap gap-1.5">
                 {Array.isArray(evalResult.confluences) &&
                   evalResult.confluences.map((conf: any, idx: number) => {
-                    // Extract text string safely whether conf is an object or string
                     let label = '';
                     if (typeof conf === 'string') {
                       label = conf;
