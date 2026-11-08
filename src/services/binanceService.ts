@@ -43,65 +43,6 @@ export interface BinanceOrder {
 }
 
 // ======================================================
-// TEMPORARY SESSION TOKEN
-// ======================================================
-
-function getSessionToken(): string {
-
-  try {
-
-    return sessionStorage.getItem(
-      SESSION_KEY
-    ) || '';
-
-  } catch {
-
-    return '';
-
-  }
-
-}
-
-function saveSessionToken(token: string): void {
-
-  if (!token) {
-    throw new Error('Server did not return a session token.');
-  }
-
-  try {
-
-    sessionStorage.setItem(
-      SESSION_KEY,
-      token
-    );
-
-  } catch {
-
-    throw new Error(
-      'Unable to save the temporary connection session.'
-    );
-
-  }
-
-}
-
-function clearSessionToken(): void {
-
-  try {
-
-    sessionStorage.removeItem(
-      SESSION_KEY
-    );
-
-  } catch {
-
-    // Nothing else to clear.
-
-  }
-
-}
-
-// ======================================================
 // GENERAL API REQUEST
 // ======================================================
 
@@ -121,16 +62,6 @@ export async function apiRequest<T>(
 
   }
 
-  const token = getSessionToken();
-
-  if (token) {
-
-    headers.set(
-      'X-TS-Session',
-      token
-    );
-
-  }
 
   const response = await fetch(endpoint, {
 
@@ -220,10 +151,8 @@ export async function connectBinanceDemo(
 
   }
 
-  // The server returns an application session token,
-  // NOT the Binance API key or secret.
-
-  saveSessionToken(data.sessionToken);
+  // The backend stores credentials in an HttpOnly session cookie.
+  // The browser sends that cookie automatically on same-origin requests.
 
   return data as BinanceConnectionResult;
 
@@ -240,13 +169,6 @@ Promise<BinanceConfig> {
     '/api/binance/config'
   );
 
-  // An expired or invalid session is removed.
-
-  if (!result.credentialsConfigured) {
-
-    clearSessionToken();
-
-  }
 
   return result;
 
@@ -305,7 +227,6 @@ Promise<{
     }
   );
 
-  clearSessionToken();
 
   return result;
 
