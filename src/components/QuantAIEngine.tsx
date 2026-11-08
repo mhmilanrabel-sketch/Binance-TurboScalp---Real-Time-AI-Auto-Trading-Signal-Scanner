@@ -76,8 +76,9 @@ export function QuantAIEngine() {
   const [error, setError] = useState('');
 
   const [bot, setBot] = useState(false);
+  const [botMessage, setBotMessage] = useState('Bot is paused.');
   const [size, setSize] = useState('25');
-  const [maxOpen, setMaxOpen] = useState('3');
+  const [maxOpen, setMaxOpen] = useState('1');
 
   const [trades, setTrades] = useState<PaperTrade[]>([]);
 
@@ -181,6 +182,18 @@ export function QuantAIEngine() {
     0
   );
 
+  const startBot = useCallback(() => {
+    if (bot) return;
+    setBotMessage('Starting — refreshing the market scanner and checking for a qualified setup.');
+    setBot(true);
+    void scan();
+  }, [bot, scan]);
+
+  const stopBot = useCallback(() => {
+    setBot(false);
+    setBotMessage('Bot paused. Existing paper positions remain in the journal.');
+  }, []);
+
   const discuss = async (signal: Signal) => {
     setSelected(signal);
     setExplain('');
@@ -219,6 +232,7 @@ export function QuantAIEngine() {
     if (!bot) return;
 
     const interval = setInterval(() => {
+      void scan();
       setTrades(previous => {
         let next = previous.map(trade => {
           if (trade.status !== 'OPEN') return trade;
@@ -284,7 +298,10 @@ export function QuantAIEngine() {
           )
         );
 
-        if (!candidate) return next;
+        if (!candidate) {
+          setBotMessage('RUNNING — waiting for a signal to pass all entry filters. No trade has been opened.');
+          return next;
+        }
 
         const side = candidate.direction as 'BUY' | 'SELL';
 
@@ -301,6 +318,16 @@ export function QuantAIEngine() {
           candidate.takeProfit ||
           candidate.price * (side === 'BUY' ? 1.02 : 0.98);
 
+        if (
+          !Number.isFinite(stop) ||
+          !Number.isFinite(target) ||
+          (side === 'BUY' && !(stop < candidate.price && target > candidate.price)) ||
+          (side === 'SELL' && !(stop > candidate.price && target < candidate.price))
+        ) {
+          setBotMessage(`RUNNING — skipped ${candidate.symbol}: invalid stop-loss / take-profit levels.`);
+          return next;
+        }
+
         const newTrade: PaperTrade = {
           id: Date.now(),
           symbol: candidate.symbol,
@@ -312,12 +339,13 @@ export function QuantAIEngine() {
           status: 'OPEN',
         };
 
+        setBotMessage(`RUNNING — opened one paper ${side} position on ${candidate.symbol}.`);
         return [newTrade, ...next].slice(0, 100);
       });
     }, 15000);
 
     return () => clearInterval(interval);
-  }, [bot, signals, size, maxOpen]);
+  }, [bot, signals, size, maxOpen, scan]);
 
   return (
     <section className="rounded-2xl border border-cyan-500/25 bg-[#0d1726] p-4 md:p-5 space-y-4">
@@ -534,9 +562,20 @@ export function QuantAIEngine() {
             </label>
           </div>
 
+          <div className={`rounded-lg border px-3 py-2 text-[10px] ${bot ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-slate-700 bg-slate-900 text-slate-400'}`}>
+            <span className="font-bold">{bot ? '● RUNNING' : '○ PAUSED'}</span>
+            <span className="ml-2">{botMessage}</span>
+          </div>
+
           <button
-            onClick={() => setBot(value => !value)}
-            className={`w-full rounded-lg p-3 text-xs font-black ${
+            type="button"
+            aria-label={bot ? 'Stop autonomous paper bot' : 'Start autonomous paper bot'}
+            onClick={event => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (bot) stopBot(); else startBot();
+            }}
+            className={`relative z-20 w-full cursor-pointer touch-manipulation select-none rounded-lg p-3 text-xs font-black pointer-events-auto ${
               bot
                 ? 'border border-rose-500/40 bg-rose-500/10 text-rose-300'
                 : 'bg-cyan-400 text-slate-950'
