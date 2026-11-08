@@ -229,11 +229,20 @@ export function ApiSettingsModal({
         new Date().toLocaleString()
       );
 
-      setMessage(
-        'API KEY ACTIVE. Authentication and account balance verified successfully.'
-      );
-
-      setError(false);
+      if (
+        verification.orderTestPassed &&
+        Boolean(account.canTrade)
+      ) {
+        setMessage(
+          'API AUTHENTICATED. Futures permission is enabled and Binance accepted the non-executing order test. No order was placed.'
+        );
+        setError(false);
+      } else {
+        setMessage(
+          `API AUTHENTICATED, BUT FUTURES TRADING IS NOT CONFIRMED. Account canTrade: ${Boolean(account.canTrade) ? 'true' : 'false'}. Binance order-test response: ${verification.orderTestMessage}`
+        );
+        setError(true);
+      }
 
     } catch (err: any) {
 
