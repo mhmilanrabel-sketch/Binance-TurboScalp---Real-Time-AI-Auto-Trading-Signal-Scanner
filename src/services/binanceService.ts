@@ -178,14 +178,21 @@ Promise<BinanceConfig> {
 // CONNECTION RECHECK
 // ======================================================
 
-export async function testBinanceConnection():
-Promise<{
+export interface BinancePermissionTest {
   success: boolean;
+  authenticated: boolean;
   canTrade: boolean;
+  orderTestPassed: boolean;
+  orderTestMessage: string;
+  orderTestCode?: number;
+  permissionStatus: string;
   message: string;
-}> {
+}
 
-  return apiRequest(
+export async function testBinanceConnection():
+Promise<BinancePermissionTest> {
+
+  return apiRequest<BinancePermissionTest>(
     '/api/binance/test',
     {
       method: 'POST'
