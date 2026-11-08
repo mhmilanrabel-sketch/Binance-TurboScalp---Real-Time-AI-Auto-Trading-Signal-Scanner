@@ -856,6 +856,7 @@ app.post('/api/binance/test', async (req, res) => {
     const credentials =
       getSessionCredentials(req)!;
 
+    // First verify signed Futures account access.
     const account = await binanceRequest<any>(
       'GET',
       '/fapi/v3/account',
@@ -864,14 +865,71 @@ app.post('/api/binance/test', async (req, res) => {
       credentials
     );
 
+    // This endpoint validates the order request but NEVER executes it.
+    // A small BTCUSDT Demo test is used only to identify exchange-side
+    // Futures trading permission errors. No real order is submitted.
+    let orderTestPassed = false;
+    let orderTestMessage = '';
+    let orderTestCode: number | undefined;
+
+    try {
+
+      const testOrder = await calculateDemoOrder({
+        symbol: 'BTCUSDT',
+        side: 'BUY',
+        quantityUsd: 100,
+        leverage: 1
+      });
+
+      await binanceRequest<any>(
+        'POST',
+        '/fapi/v1/order/test',
+        {
+          symbol: testOrder.symbol,
+          side: testOrder.side,
+          type: 'MARKET',
+          quantity: testOrder.quantity
+        },
+        true,
+        credentials
+      );
+
+      orderTestPassed = true;
+      orderTestMessage =
+        'Binance accepted the non-executing order validation. No order was placed.';
+
+    } catch (testError: any) {
+
+      orderTestPassed = false;
+      orderTestMessage =
+        testError?.message ||
+        'Binance rejected the non-executing order validation.';
+      orderTestCode =
+        typeof testError?.code === 'number'
+          ? testError.code
+          : undefined;
+
+    }
+
+    const canTrade = Boolean(account.canTrade);
+
     res.json({
 
       success: true,
-
-      canTrade: Boolean(account.canTrade),
-
-      message:
-        'Binance account authenticated successfully.'
+      authenticated: true,
+      canTrade,
+      orderTestPassed,
+      orderTestMessage,
+      ...(orderTestCode !== undefined
+        ? { orderTestCode }
+        : {}),
+      permissionStatus:
+        canTrade && orderTestPassed
+          ? 'TRADING_READY'
+          : 'AUTHENTICATED_BUT_TRADING_NOT_CONFIRMED',
+      message: canTrade && orderTestPassed
+        ? 'Binance Demo authentication and non-executing Futures order validation passed.'
+        : 'API authentication succeeded, but Futures order permission is not confirmed. See orderTestMessage for the exact Binance response.'
 
     });
 
